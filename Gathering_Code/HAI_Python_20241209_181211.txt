@@ -1,0 +1,4339 @@
+### C:\repository\HAI_Python\main.py ###
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.routers.chatbot_router import chatbot_router
+from app.routers.book_router import book_router
+from app.routers.auth_router import auth_router 
+from app.routers.plan_router import plan_router
+from app.routers.chat_agent_router import chat_agent_router
+from app.routers.festival_router import festival_router
+
+app = FastAPI()
+
+# CORS 설정
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # React 앱의 주소
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 라우터 등록
+app.include_router(chatbot_router, prefix="/api/chatbot")
+app.include_router(book_router, prefix="/api/book")
+app.include_router(auth_router, prefix="/api/auth")  
+app.include_router(plan_router, prefix="/api/plan")
+app.include_router(chat_agent_router, prefix="/api/chat")
+app.include_router(festival_router, prefix="/api/festival")
+
+@app.get("/")
+async def read_root():
+    return {"message": "API 서버가 정상적으로 실행 중입니다."}
+
+
+### C:\repository\HAI_Python\app\agents.py ###
+from app.chat_agent import TravelChatAgent
+
+# 전역 TravelChatAgent 인스턴스를 생성
+travel_chat_agent = TravelChatAgent()
+
+
+### C:\repository\HAI_Python\app\chat_agent.py ###
+from langchain_openai import ChatOpenAI
+from typing import Optional
+import os
+import requests
+from dotenv import load_dotenv
+from app.plan_agent import plan_travel, calculate_trip_days  # 추가
+import json
+
+load_dotenv()
+
+class TravelChatAgent:
+    def __init__(self):
+        self.current_travel_plan = None
+        self.destination = None
+        self.travel_style = None
+        self.user_info = None  # 사용자 정보 추가
+        
+        self.llm = ChatOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            model_name="gpt-3.5-turbo",
+            temperature=0.7
+        )
+        self.chat_history = []
+        self.max_turns = 6
+        
+        # 네이버 API 설정
+        self.naver_headers = {
+            "X-Naver-Client-Id": os.getenv("NAVER_CLIENT_ID"),
+            "X-Naver-Client-Secret": os.getenv("NAVER_CLIENT_SECRET")
+        }
+
+    def set_user_info(self, user_info: dict):
+        """여행자 정보 설정"""
+        self.user_info = user_info
+        self.destination = user_info.get('destination')
+        self.travel_style = user_info.get('style')
+        self.current_travel_plan = user_info  # 여행 계획을 최신으로 설정
+
+        # 여행 계획 생성 (옵션: 처음 생성이 아닐 때는 업데이트)
+        if not self.current_travel_plan:
+            try:
+                result = plan_travel(self.user_info)
+                if result:
+                    self.current_travel_plan = json.loads(result)
+            except Exception as e:
+                print(f"여행 계획 생성 중 오류 발생: {e}")
+
+    def _parse_travel_plan(self, context: str) -> dict:
+        """여행 플랜에서 주요 정보 추출"""
+        plan_info = {
+            'places': [],  # 계획된 장소들
+            'schedule': {} # 일정별 정보
+        }
+        
+        try:
+            # Day 1, Day 2 등으로 시작하는 일정 파싱
+            days = context.split('[Day')
+            for day in days[1:]:  # 첫 번째는 빈 문자열이므로 제외
+                day_info = []
+                lines = day.split('\n')
+                current_day = lines[0].strip().rstrip(']')
+                
+                for line in lines:
+                    if '주소:' in line:
+                        place = {
+                            'name': lines[lines.index(line)-1].split(':')[-1].strip(),
+                            'address': line.split('주소:')[-1].strip(),
+                        }
+                        day_info.append(place)
+                        plan_info['places'].append(place)
+                
+                plan_info['schedule'][current_day] = day_info
+                
+        except Exception as e:
+            print(f"여행 플랜 파싱 중 오류 발생: {e}")
+        
+        return plan_info
+
+    def search_naver_blog(self, query: str) -> str:
+        """네이버 블로그 검색 - 지역 필터링 추가"""
+        if not self.destination:
+            print("Warning: destination이 설정되지 않았습니다!")
+            return "여행 목적지 정보가 없습니다."
+
+        # URL 정의 추가
+        url = "https://openapi.naver.com/v1/search/blog"
+        
+        print(f"현재 설정된 destination: {self.destination}")
+        
+        # 검색어에 destination을 앞에 명확하게 포함
+        search_query = f"{self.destination} {query}"
+        params = {
+            "query": search_query,
+            "display": 10,
+            "sort": "sim"
+        }
+        
+        print(f"\n=== 네이버 블로그 검색 요청 ===")
+        print(f"검색어: {search_query}")
+        
+        response = requests.get(url, headers=self.naver_headers, params=params)
+        print(f"응답 상태 코드: {response.status_code}")
+        
+        if response.status_code == 200:
+            items = response.json().get('items', [])
+            filtered_items = []
+            
+            print(f"\n검색된 블로그 글 목록:")
+            for item in items:
+                print(f"\n제목: {item['title'].replace('<b>', '').replace('</b>', '')}")
+                print(f"링크: {item['link']}")
+                
+                # 제목이나 내용에 destination이 포함된 결과만 필터링
+                if self.destination in item['title'] or self.destination in item['description']:
+                    filtered_items.append(item)
+            
+            if not filtered_items:
+                return f"{self.destination}의 관련 정보를 찾을 수 없습니다."
+            
+            # 가장 관련성 높은 첫 번째 결과 선택
+            best_result = filtered_items[0]
+            
+            results = f"""
+                가장 관련성 높은 블로그 글:
+                제목: {best_result['title'].replace('<b>', '').replace('</b>', '')}
+                내용: {best_result['description'].replace('<b>', '').replace('</b>', '')}
+                링크: {best_result['link']}
+                """
+            return results
+        return "검색 결과를 찾을 수 없습니다."
+
+    def search_naver_local(self, query: str) -> str:
+        """네이버 지역 검색 - 지역 필터링 추가"""
+        url = "https://openapi.naver.com/v1/search/local"
+        params = {
+            "query": f"{self.destination} {query}",
+            "display": 5,
+            "sort": "random"
+        }
+        
+        response = requests.get(url, headers=self.naver_headers, params=params)
+        
+        if response.status_code == 200:
+            items = response.json().get('items', [])
+            filtered_items = []
+            
+            for item in items:
+                # 주소에 destination이 포함된 결과만 필터링
+                if self.destination in item['address']:
+                    filtered_items.append(item)
+            
+            if not filtered_items:
+                return f"{self.destination}의 관련 장소를 찾을 수 없습니다."
+            
+            results = f"🏢 {self.destination} 관련 장소:\n"
+            for item in filtered_items:
+                results += f"""
+                장소명: {item['title'].replace('<b>', '').replace('</b>', '')}
+                주소: {item['address']}
+                도로명: {item.get('roadAddress', '정보 없음')}
+                카테고리: {item.get('category', '정보 없음')}
+                전화: {item.get('telephone', '정보 없음')}
+                -------------------"""
+            return results
+        return "검색 결과를 찾을 수 없습니다."
+
+    async def get_answer(self, question: str, context: Optional[str] = None) -> str:
+        """챗봇 답변 생성 - 여행 플랜 고려"""
+        if not self.destination:
+            return "죄송합니다. 여행 목적지 정보가 없습니다."
+            
+        # 채팅 기록 관리
+        if len(self.chat_history) > self.max_turns * 2:
+            self.chat_history = self.chat_history[-self.max_turns * 2:]
+
+        # 검색 수행
+        blog_results = self.search_naver_blog(question)
+        local_results = self.search_naver_local(question)
+
+        # GPT 프롬프트 구성
+        system_content = f"""당신은 {self.destination} 지역 전문 여행 챗봇입니다.
+        현재 계획된 여행 정보:
+        - 목적지: {self.destination}
+        - 여행 스타일: {self.travel_style if self.travel_style else '정보 없음'}
+        
+        중요: 반드시 {self.destination} 지역의 정보만 추천해주세요.
+        다른 도시의 정보는 추천하지 마세요.
+        
+        여행 계획: {context if context else json.dumps(self.current_travel_plan)}
+        """
+
+        messages = [
+            {"role": "system", "content": system_content}
+        ]
+        
+        # 이전 대화 기록 추가
+        messages.extend(self.chat_history)
+        
+        # 현재 질문 관련 정보 추가
+        messages.append({"role": "user", "content": f"""
+            질문: {question}
+            
+            네이버 블로그 검색 결과:
+            {blog_results}
+            
+            네이버 지역 검색 결과:
+            {local_results}
+        """})
+        
+        # GPT 응답 생성
+        response = await self.llm.agenerate([messages])
+        answer = response.generations[0][0].text.strip()
+        
+        # 대화 기록 저장
+        self.chat_history.append({"role": "user", "content": question})
+        self.chat_history.append({"role": "assistant", "content": answer})
+        
+        return answer
+
+
+### C:\repository\HAI_Python\app\plan_agent.py ###
+from crewai import Agent, Task, Crew
+from crewai_tools import BaseTool, SerperDevTool, CSVSearchTool
+from typing import Optional
+import requests
+import os
+import json
+from dotenv import load_dotenv
+from datetime import datetime
+import pandas as pd
+import unicodedata
+import re
+
+# 환경변수 로딩 및 검사
+load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # 현재 파일 기준의 절대 경로
+TRAVEL_DATA_DIR = os.path.join(BASE_DIR,  'travel','data')  # travel/data 디렉토리 경로
+
+# API 키 확인
+if not os.getenv("OPENAI_API_KEY"):
+    raise ValueError("OPENAI_API_KEY not found in environment variables")
+if not os.getenv("SERPER_API_KEY"):
+    raise ValueError("SERPER_API_KEY not found in environment variables")
+if not os.getenv("NAVER_CLIENT_ID") or not os.getenv("NAVER_CLIENT_SECRET"):
+    raise ValueError("NAVER API credentials not found in environment variables")
+if not os.getenv("KAKAO_REST_API_KEY"):
+    raise ValueError("KAKAO_REST_API_KEY not found in environment variables")
+
+def get_csv_file_paths(destination: str) -> dict:
+    """
+    주어진 목적지(destination)에 해당하는 여행지와 맛집 CSV 파일 경로를 반환합니다.
+    """
+    base_paths = {
+        'travel': os.path.join(TRAVEL_DATA_DIR, 'travel'),
+        'food': os.path.join(TRAVEL_DATA_DIR, 'food'),
+    }
+    
+    result = {'travel': None, 'food': None}
+    for category, base_path in base_paths.items():
+        if not os.path.exists(base_path):
+            print(f"Error: '{base_path}' 경로가 존재하지 않습니다.")
+            continue
+
+        print(f"'{base_path}' 경로에서 파일을 검색 중...")
+        normalized_destination = unicodedata.normalize('NFC', destination)
+
+        for file_name in os.listdir(base_path):
+            normalized_file_name = unicodedata.normalize('NFC', file_name)
+            if normalized_destination in normalized_file_name and normalized_file_name.endswith('.csv'):
+                print(f"{destination}에 해당하는 {category} 파일 찾음: {file_name}")
+                result[category] = os.path.join(base_path, file_name)
+                break
+
+        if result[category] is None:
+            print(f"{destination}에 해당하는 {category} CSV 파일을 찾을 수 없습니다.")
+
+    return result
+
+import pandas as pd
+
+def convert_csv_to_utf8(original_csv_path: str, temp_csv_path: str) -> None:
+    """
+    CSV 파일을 UTF-8로 변환하여 임시 파일로 저장합니다.
+    """
+    try:
+        # 파일을 'utf-8' 인코딩으로 시도해서 읽기
+        df = pd.read_csv(original_csv_path, encoding='utf-8')
+    except UnicodeDecodeError:
+        # 만약 'utf-8'로 읽기 실패하면 'euc-kr'로 시도
+        try:
+            df = pd.read_csv(original_csv_path, encoding='euc-kr')
+        except UnicodeDecodeError:
+            # 'euc-kr'도 실패하면 'latin1'로 시도
+            df = pd.read_csv(original_csv_path, encoding='latin1')
+
+    # UTF-8로 저장
+    df.to_csv(temp_csv_path, encoding='utf-8', index=False)
+    print(f"{original_csv_path} 파일을 UTF-8로 변환하여 {temp_csv_path}에 저장했습니다.")
+
+def calculate_trip_days(start_date, end_date):
+    """
+    여행 일수를 계산하는 함수
+    YYYY-MM-DD 형식의 날짜를 처리하며, 연도와 월이 바뀌는 경우도 처리
+    """
+    try:
+        # 만약 start_date와 end_date가 문자열이면 datetime 객체로 변환
+        if isinstance(start_date, str):
+            start_date = datetime.strptime(start_date, '%Y-%m-%d')
+        if isinstance(end_date, str):
+            end_date = datetime.strptime(end_date, '%Y-%m-%d')
+        
+        # 시작일과 종료일의 차이 계산
+        date_diff = end_date - start_date
+        nights = date_diff.days
+        days = nights + 1
+
+        # 유효성 검사
+        if days <= 0:
+            raise ValueError("종료일이 시작일보다 빠릅니다.")
+        if days > 365:
+            raise ValueError("여행 기간이 1년을 초과할 수 없습니다.")
+            
+        # 날짜 정보 디버깅
+        print(f"여행 정보:")
+        print(f"시작일: {start_date.strftime('%Y년 %m월 %d일')}")
+        print(f"종료일: {end_date.strftime('%Y년 %m월 %d일')}")
+        print(f"총 {nights}박 {days}일")
+        
+        # 연도나 월이 바뀌는지 확인
+        if start_date.year != end_date.year:
+            print(f"주의: 연도가 바뀌는 여행입니다 ({start_date.year}년 → {end_date.year}년)")
+        elif start_date.month != end_date.month:
+            print(f"주의: 월이 바뀌는 여행입니다 ({start_date.month}월 → {end_date.month}월)")
+        
+        return (nights, days)
+        
+    except ValueError as e:
+        print(f"날짜 오류: {e}")
+        print("YYYY-MM-DD 형식으로 입력해주세요 (예: 2024-11-20)")
+        return (0, 0)
+    except Exception as e:
+        print(f"예상치 못한 오류 발생: {e}")
+        return (0, 0)
+    
+
+class KakaoLocalSearchTool(BaseTool):
+    """카카오 로컬 API를 이용한 좌표 검색 도구"""
+    name: str = "Kakao Local Search"
+    description: str = "카카오 로컬 API로 주소를 검색하여 좌표를 반환합니다."
+    api_key: str = ""  # 필드 선언 추가
+    headers: dict = {}  # 필드 선언 추가
+
+    def __init__(self):
+        super().__init__()
+        self.api_key = os.getenv("KAKAO_REST_API_KEY")
+        if not self.api_key:
+            raise ValueError("KAKAO_REST_API_KEY not found in environment variables")
+        self.headers = {
+            "Authorization": f"KakaoAK {self.api_key}"
+        }
+
+    def _run(self, address: str) -> str:
+        """BaseTool 요구사항을 충족하기 위한 메소드"""
+        result = self.get_coordinates(address)
+        return json.dumps(result, ensure_ascii=False) if result else json.dumps({"error": "주소를 찾을 수 없습니다."})
+
+
+    def get_coordinates(self, address: str) -> dict:
+        """주소를 검색하여 좌표를 반환합니다."""
+        url = "https://dapi.kakao.com/v2/local/search/address.json"
+        params = {"query": address}
+        
+        try:
+            response = requests.get(url, headers=self.headers, params=params)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get('documents'):
+                document = result['documents'][0]
+                return {
+                    "address_name": document.get('address_name', ''),
+                    "x": document.get('x'),  # 경도
+                    "y": document.get('y')   # 위도
+                }
+            return None
+            
+        except Exception as e:
+            print(f"카카오 API 호출 중 오류 발생: {e}")
+            return None
+
+class NaverLocalSearchTool(BaseTool):
+    """네이버 지역 검색과 카카오 좌표 변환 통합 도구"""
+    name: str = "Naver Local Search"
+    description: str = "네이버 지역 검색으로 장소를 검색하고 카카오 API로 좌표를 조회합니다."
+    client_id: str = ""  # 필드 선언 추가
+    client_secret: str = ""  # 필드 선언 추가
+    headers: dict = {}  # 필드 선언 추가
+    kakao_tool: KakaoLocalSearchTool = None  # 필드 추가
+
+
+    def __init__(self):
+        super().__init__()
+        self.client_id = os.getenv("NAVER_CLIENT_ID")
+        self.client_secret = os.getenv("NAVER_CLIENT_SECRET")
+        self.headers = {
+            "X-Naver-Client-Id": self.client_id,
+            "X-Naver-Client-Secret": self.client_secret
+        }
+        self.kakao_tool = KakaoLocalSearchTool()
+
+
+    def _run(self, query: str) -> str:
+        url = "https://openapi.naver.com/v1/search/local"
+        params = {
+            "query": query,
+            "display": 10,
+            "sort": "random"
+        }
+        
+        try:
+            response = requests.get(url, headers=self.headers, params=params)
+            response.raise_for_status()
+            items = response.json().get('items', [])
+            
+            results = []
+            for item in items:
+                place_info = {
+                    "name": item['title'].replace('<b>', '').replace('</b>', ''),
+                    "address": item['address'],
+                    "category": item.get('category', '정보 없음'),
+                    "roadAddress": item.get('roadAddress', '정보 없음'),
+                    "telephone": item.get('telephone', '정보 없음')
+                }
+                
+                # 카카오 API로 좌표 조회
+                coordinates = self.kakao_tool.get_coordinates(item['address'])
+                if coordinates:
+                    place_info.update({
+                        "address_name": coordinates['address_name'],
+                        "x": coordinates['x'],
+                        "y": coordinates['y']
+                    })
+                
+                results.append(place_info)
+            
+            return json.dumps({
+                "places": results
+            }, ensure_ascii=False, indent=2)
+            
+        except Exception as e:
+            print(f"검색 중 오류 발생: {e}")
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+def create_travel_agents(llm, user_info):
+    # Serper Tool 초기화
+    search_tool = SerperDevTool()
+    
+    # 네이버 로컬 검색 도구 초기화 (카카오 좌표 변환 포함)
+    local_tool = NaverLocalSearchTool()
+
+    # 목적지에 해당하는 CSV 파일 경로 가져오기
+    destination = user_info["destination"]
+    style = user_info["style"]
+
+    csv_paths = get_csv_file_paths(destination)
+
+    if not csv_paths['travel'] and not csv_paths['food']:
+        print(f"{destination}에 해당하는 CSV 파일을 찾을 수 없습니다.")
+        return None, None, None, None
+
+
+    # DataFrame으로 직접 로드하여 메모리에서 처리
+    def load_csv_to_df(path):
+        try:
+            df = pd.read_csv(path, encoding='utf-8')
+        except UnicodeDecodeError:
+            try:
+                df = pd.read_csv(path, encoding='euc-kr')
+            except UnicodeDecodeError:
+                df = pd.read_csv(path, encoding='latin1')
+        
+        print(f"로드된 CSV 파일 경로: {path}")
+        print(f"데이터 샘플:\n{df.head()}")
+        print(f"총 행 수: {len(df)}")
+    
+        csv_str = df.to_csv(index=False)
+        return csv_str
+
+
+    # 각 에이전트별 CSVSearchTool 초기화
+    travel_csv_tool = CSVSearchTool(csv=load_csv_to_df(csv_paths['travel']) if csv_paths['travel'] else None)
+    food_csv_tool = CSVSearchTool(csv=load_csv_to_df(csv_paths['food']) if csv_paths['food'] else None)
+
+    # 맞춤형 여행 조사 에이전트
+    personal_researcher = Agent(
+        role='맞춤형 여행 조사 에이전트',
+        goal=f'{user_info["age"]} {user_info["gender"]}의 맞춤형 여행지 추천',
+        backstory=f"""여행 전문가로서 {user_info['age']} {user_info['gender']}이(가) {user_info['companion']}와 
+                   함께하는 {user_info['style']} 스타일의 여행을 위한 최적의 장소들을 추천합니다.""",
+        tools=[search_tool],
+        llm=llm,
+        verbose=True
+    )
+
+    # 1. 관광지 분석 Agent
+    tourist_spot_researcher = Agent(
+        role='Tourist Spot Analyst',
+        goal=f'{user_info["style"]} 스타일에 맞는 관광지 분석',
+        backstory=f'{destination}관광지 데이터를 분석하여 {user_info["style"]} 스타일에 적합한 장소를 추천하는 전문가입니다.',
+        tools=[CSVSearchTool(csv=load_csv_to_df(csv_paths['travel']))],
+
+        verbose=True
+    )
+
+
+    # 2. 맛집 분석 Agent
+    restaurant_researcher = Agent(
+        role='Restaurant Analyst',
+        goal='{destination}관광지 주변 맛집 분석',
+        backstory='{destination}관광지 주변의 맛집을 분석하여 적합한 식당을 추천하는 전문가입니다.',
+        tools=[CSVSearchTool(csv=load_csv_to_df(csv_paths['food']))],
+        verbose=True
+    )
+
+
+    # 일정 계획 에이전트
+    itinerary_planner = Agent(
+        role='여행 일정 수립 에이전트',
+        goal='효율적인 여행 동선 계획',
+        backstory="""personal_task에서 추천된 {style} 장소들을 중심으로 {days}일간의 여행 일정을 계획해주세요.
+                    1시간 이내 이동 가능한 효율적인 동선을 설계하는 전문가입니다.""",
+        tools=[local_tool],
+        llm=llm,
+        verbose=True
+    )
+
+    return personal_researcher, tourist_spot_researcher, restaurant_researcher, itinerary_planner
+
+
+def create_tasks(agents, user_info):
+    personal_researcher, tourist_spot_researcher, restaurant_researcher, itinerary_planner = agents
+    destination = user_info['destination']
+    style = user_info['style'] 
+    age = user_info['age'] 
+
+    search_queries = {
+        '국가유산': f"{destination} {age} 추천 유적지 문화재 박물관 명소",
+        '휴양': f"{destination} {age} 추천 힐링스팟 카페 휴식 산 공원 명소",
+        '액티비티': f"{destination} {age} 추천 액티비티 체험 관광 즐길거리",
+        '식도락': f"{destination} {age} 맛집 추천 현지맛집 유명식당",
+        'SNS감성': f"{destination} {age} 인스타 핫플레이스 감성카페 포토스팟"
+    }
+    
+    travel_style_prompts = {
+        '국가유산': f"""
+            {destination}의 대표적인 국가유산와 역사 관광지를 찾아주세요.
+            - 유명 국가유산와 유적지
+            - 박물관과 전시관
+            - {user_info['companion']}와 함께 둘러보기 좋은 곳
+            - 관람 소요시간과 볼거리 포함
+        """,
+        
+        '휴양': f"""
+            {age}연령대가 {destination}의 힐링하기 좋은 장소들을 찾아주세요.
+            - 힐링 명소와 조용한 장소
+            - 경관이 좋은 카페와 휴식 공간
+            - 자연 경관이 아름다운 곳
+            - {user_info['companion']}와 편안한 시간을 보내기 좋은 곳
+        """,
+        
+        '액티비티': f"""
+            {age}연령대가 {destination}의 체험형 관광지와 액티비티를 찾아주세요.
+            - {user_info['age']} {user_info['gender']}의 체력 수준에 적합한 활동
+            - {user_info['companion']}와 함께 즐기기 좋은 체험
+            - 안전하고 초보자도 할 수 있는 활동
+            - 계절/날씨별 추천 활동
+        """,
+        
+        '식도락': f"""
+            {destination}의 맛집과 음식점을 찾아주세요.
+            - 현지 맛집과 유명 식당
+            - {user_info['companion']}와 식사하기 좋은 분위기의 장소
+            - 특별한 지역 음식과 대표 메뉴
+            - 가격대와 영업시간 정보
+        """,
+        
+        'SNS감성': f"""
+            {destination}의 인스타그램 핫플레이스를 찾아주세요.
+            - 인기 있는 포토스팟
+            - 뷰가 좋은 감성 카페
+            - {user_info['age']} {user_info['gender']}이 좋아할만한 트렌디한 장소
+            - 예쁜 사진을 찍을 수 있는 명소
+        """
+    }
+
+
+    
+    # search_query = f"{destination} {style}추천 {user_info['age']} {user_info['gender']} {user_info['companion']}"
+
+
+    personal_task = Task(
+        name="사용자 맞춤형 여행 조사",
+        description=f"""
+            Search Query: {search_queries[style]}
+
+            다음 프롬프트를보고 연령대 여행스타일 맞춤 장소 15개 리스트를 작성하세요.
+            {travel_style_prompts[style]}
+            
+            **주의사항:**
+            - {user_info['age']} {user_info['gender']}이(가) {user_info['companion']}와 함께하는 
+            {user_info['style']} {destination} 여행을 위한 장소 15개 리스트를 작성하세요.
+            - 계절과 날씨를 고려한 추천
+            - {user_info['age']} {user_info['gender']}의 선호도 고려
+
+            반드시 문자열로 작성
+
+            """,
+        expected_output='사용자 특성에 맞는 맞춤형 여행 추천 보고서',
+        agent=personal_researcher
+    )
+
+
+    # Task 1: 관광지 분석
+    tourist_spot_task = Task(
+        name="관광지 데이터 분석",
+        description=f"""
+            {destination}
+            반드시 CSV 파일의 '분류' 컬럼에서 '{style}' 스타일에 맞는 장소만 찾아주세요.
+            - 여행 스타일별 키워드:
+            * 문화재: '역사유적지', '박물관', '전시시설'
+            * 휴양: '자연경관', '도시공원', '테마공원', '레저스포츠시설'
+            * 액티비티: '레저스포츠시설', '체험시설'
+            * SNS감성: '랜드마크관광', '테마공원'
+            * 식도락: '시장', '쇼핑몰'
+        
+            다음 형식으로 출력해주세요:
+            장소: [관광지명]
+            주소: [주소]
+    
+        """,
+        expected_output="관광지 추천 목록",
+        agent=tourist_spot_researcher
+    )
+
+
+        # Task 2: 맛집 분석
+    restaurant_task = Task(
+        name="{destination}주변 맛집 분석",
+        description=f"""
+                {destination}
+                tourist_spot_task에서 조회된 관광지 주소를 기반으로  파일에서 주변 맛집을 검색하세요.
+                반드시 CSV 파일의 '주소' 컬럼에서 행정구역이 일치하는 장소만 찾아주세요.
+                
+                각 구별로 다음과 같이 한 번씩 검색하세요:
+                {{
+                "search_query": "행정구", "행정시"
+                }}
+
+                이런 식으로 각 시,구별로 개별 검색을 수행하세요.
+
+                  
+                각 관광지 주소의 구(區)를 기준으로 2-3곳의 맛집을 추천하세요.
+
+                다음 형식으로 출력해주세요.
+                1. 식당: [맛집명]
+                주소: [도로명주소]
+
+            """,
+        expected_output="행정구역별 맛집 추천 목록",
+        agent=restaurant_researcher
+)
+
+
+    nights, days = calculate_trip_days(user_info['start_date'], user_info['end_date'])
+    
+    
+
+    planning_task = Task(
+        name="여행 일정 계획 수립",
+        description=f"""
+                도로명주소를 문자열로 전달하고 반환하세요.
+                세 가지 task의 결과를 균형있게 활용하여 {days}일간의 {age}대 {style} {destination}여행 일정을 계획하세요.
+
+                 장소 주소 검색 시:
+                - 네이버 검색은 **다음과 같은 형식**으로 장소명을 전달해야 합니다.
+                **네이버 검색 사용 시 주의사항:**
+                - Action Input은 반드시 딕셔너리 형식으로 입력하세요.
+                - 올바른 형식: **Action Input: {{"query": "장소명"}}**
+                - 잘못된 형식:
+                - Action Input: 가로수길  # 문자열만 입력하면 안 됩니다.
+                - Action Input: "가로수길"  # 따옴표로 감싼 문자열만 입력하면 안 됩니다.
+                - Action Input: {{"name": "가로수길"}}  # 키 이름이 잘못되었습니다.
+
+                반영 비율:
+                1. personal_task (웹 검색 결과) - 60% 반영
+                    - 반드시 하루에 2-3곳은 포함할 것
+
+                2. tourist_spot_task (관광지 CSV) - 20% 반영
+                    - 유명 관광지나 랜드마크는 하루 1곳 정도만 포함
+                    - 이동 동선 상 필요한 경우에만 추가
+           
+                3. restaurant_task (맛집 CSV) - 20% 반영
+                    - 점심, 저녁 식사 시간에 맞춰 배치
+                    - 주요 장소 근처의 맛집 위주로 선정
+                
+
+                **일정 작성 가이드:**
+                이동 시간 규칙:
+                1. 1시간 이내로 이동 장소
+                2. 연속된 장소들은 반드시 같은 시/군/구 내에서 선택
+                3. 다른 시/군으로 이동할 경우 다음 날 일정으로 계획
+                4. 하루에 한 개의 시/군만 방문
+                5. 각 장소의 도로명주소 필수 (네이버 검색으로 확인)
+                6. 반드시 식사, 간식, 휴식 등을 고려해 현실적인 여행계획을 고려하세요.
+                 - 오전(9-12시): personal_task + tourist_spot_task
+                - 점심(12-2시): restaurant_task의 맛집
+                - 오후(2-6시): tourist_spot_task의 관광지 + personal_task의 장소
+                - 저녁(6시 이후): restaurant_task의 맛집 + personal_task의 저녁 장소
+
+                1일차: [도시/군/구] 내 일정만 구성
+                2일차: [도시/군/구] 내 일정만 구성
+                3일차: [도시/군/구] 내 일정만 구성
+
+                **반드시 아래의 JSON 형식으로 작성하고, {days}일 모두 포함해야 합니다**
+
+        {{
+            "result": {{
+                "Day 1": [
+                    {{
+                        "time": "시간",
+                        "place": {{
+                            "장소": "장소명",
+                            "address": "주소"
+                        }}
+                    }},
+                    {{
+                        "time": "시간",
+                        "place": {{
+                            "장소": "장소명",
+                            "address": "주소"
+                        }}
+                    }},
+                    {{
+                        "time": "시간",
+                        "place": {{
+                            "장소": "장소명",
+                            "address": "주소"
+                        }}
+                    }}
+                ],
+                "Day 2": [
+                    ... (다음날 일정도 동일한 형식으로 반복)
+                ]
+            }}
+        }}
+
+        **중요:**
+        - 오직 JSON 데이터만 출력하세요.
+        - 불필요한 설명이나 추가 텍스트를 포함하지 마세요.
+        - JSON 형식을 엄격하게 지켜주세요.
+        
+
+        [다음날 일정도 동일한 형식으로 반복]
+    
+           
+        """,
+        expected_output="정확한 형식의 {days}일간 여행 일정표",
+        agent=itinerary_planner,
+        
+    )
+
+    return [personal_task, tourist_spot_task, restaurant_task,  planning_task]
+
+
+
+def plan_travel(user_info: dict):
+    from langchain_openai import ChatOpenAI
+
+   # LLM 설정
+    llm = ChatOpenAI(
+       api_key=os.getenv("OPENAI_API_KEY"),
+       model_name="gpt-4o-mini",
+       temperature=0.7,
+       max_tokens=2000
+    )
+
+
+    # 날짜를 문자열로 변환하여 user_info에 저장
+    user_info['start_date'] = user_info['start_date'].strftime('%Y-%m-%d')
+    user_info['end_date'] = user_info['end_date'].strftime('%Y-%m-%d')
+
+
+   # 에이전트 생성
+    personal_researcher, tourist_spot_researcher, restaurant_researcher, itinerary_planner = create_travel_agents(llm, user_info)
+   
+   # 작업 생성 
+    tasks = create_tasks([personal_researcher, tourist_spot_researcher, restaurant_researcher, itinerary_planner], user_info)
+    personal_task = tasks[0]
+    tourist_spot_task = tasks[1]
+    restaurant_task = tasks[2]
+    planning_task = tasks[3]
+
+    crew = Crew(
+        agents=[personal_researcher, tourist_spot_researcher, restaurant_researcher, itinerary_planner],
+        tasks=[tourist_spot_task, restaurant_task, personal_task, planning_task],
+        verbose=True,
+        task_dependencies={
+              # 맛집은 관광지 기반으로 검색
+            planning_task: [personal_task]   # planning은 모든 결과 활용
+        }
+    )
+    # 시작 전 Crew의 설정 상태를 출력
+    print("Crew 설정 상태:", crew)
+
+    crew_output = crew.kickoff()
+
+    # planning_task의 인덱스 찾기
+    try:
+        task_index = crew.tasks.index(planning_task)
+    except ValueError:
+        print("Error: planning_task가 crew.tasks에 없습니다.")
+        return None
+
+    # planning_task의 출력 가져오기
+    planning_task_output = crew_output.tasks_output[task_index]
+
+    # 결과 추출
+    result = None
+    if hasattr(planning_task_output, 'raw'):
+        result = planning_task_output.raw
+    elif hasattr(planning_task_output, 'summary'):
+        result = planning_task_output.summary
+    elif hasattr(planning_task_output, 'dict'):
+        result_dict = planning_task_output.dict()
+        if 'raw' in result_dict:
+            result = result_dict['raw']
+        elif 'summary' in result_dict:
+            result = result_dict['summary']
+    else:
+        print("Error: planning_task_output에서 결과를 추출할 수 없습니다.")
+        print("TaskOutput 객체의 속성:", dir(planning_task_output))
+        return None
+
+    # # 결과 반환
+    # return result
+
+    # 결과 반환
+    if isinstance(result, str):
+        # 이미 JSON 문자열인 경우
+        return json.loads(result)
+    elif isinstance(result, dict):
+        # 딕셔너리인 경우
+        return result
+    else:
+        print("Error: 예상치 못한 result 형식:", type(result))
+        return None
+
+
+
+
+if __name__ == "__main__":
+    user_info = {
+       "gender": "남성",
+       "age": "50대",
+       "companion": "친구",
+       "destination": "제주",
+       "style": "휴양",
+       "start_date": "2024-10-30",
+       "end_date": "2024-11-1"
+    }
+   
+    # base_path = '../data'
+    base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'travel', 'data')
+
+    if os.path.exists(base_path):
+        print("경로가 존재합니다.")
+    else:
+        print("경로를 찾을 수 없습니다.")
+
+    result = plan_travel(user_info)
+
+    if result is not None:
+        print("\n=== 최종 여행 계획 ===")
+        import json
+
+        try:
+            formatted_result = json.loads(result)
+            # formatted_result를 사용하여 원하는 데이터 처리
+            print(json.dumps(formatted_result, ensure_ascii=False, indent=2))
+        except json.JSONDecodeError as e:
+            print("JSON 파싱 오류:", e)
+            print("에이전트의 출력 결과를 확인하세요.")
+            print(result)
+    else:
+        print("여행 일정 생성 중 오류가 발생했습니다.")
+
+### C:\repository\HAI_Python\app\__init__.py ###
+
+
+### C:\repository\HAI_Python\app\chatbot\chat_with_faiss.py ###
+# chat_with_faiss.py
+import os
+import pickle
+import numpy as np
+import faiss
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain.memory import ConversationBufferMemory
+
+load_dotenv()
+
+# OpenAI 클라이언트 설정
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),  # .env 파일에서 API 키 관리
+)
+
+# SentenceTransformer 모델 로드 (jhgan/ko-sroberta-multitask 사용)
+embedding_model = SentenceTransformer("jhgan/ko-sroberta-multitask")
+
+# 코사인 유사도 FAISS 인덱스 및 메타데이터 파일 경로 설정
+base_dir = os.path.dirname(os.path.realpath(__file__))
+index_file = os.path.join(base_dir, "../FAISS/Index/jhgan_cosine_index.bin")
+metadata_file = os.path.join(base_dir, "../FAISS/Metadata/jhgan_metadata.pkl")
+
+# FAISS 인덱스 및 메타데이터 로드
+try:
+    index = faiss.read_index(index_file)
+    with open(metadata_file, "rb") as f:
+        metadata = pickle.load(f)
+    print("코사인 유사도 기반 FAISS 인덱스 및 메타데이터가 성공적으로 로드되었습니다.")
+except Exception as e:
+    print(f"FAISS 인덱스 또는 메타데이터 로드 실패: {e}")
+    exit()
+
+# LangChain 메모리 구성
+memory = ConversationBufferMemory(memory_key="chat_history")
+
+# PromptTemplate 정의
+prompt_template = """
+# 사용자의 페르소나
+'''한국 문화유산에 대해 관심이 많은 사람이며, 문화유산에 대해 잘 모르는 사람.'''
+
+# AI(화자)
+
+## 페르소나
+'''
+수십 년 경력의 문화유산 해설사로서, 문화유산에 대해 궁금한 점이 많은 사람들에게 양질의 정보를 제공하고자 합니다.
+답변은 300토큰 이내로 답변해야 합니다.
+'''
+
+## 임무 
+''' 
+답변은 300토큰 이내로 답변해야 합니다.
+사용자의 질문에 대해서 양질의 정보를 제공하고, 자연스럽고 인간적인 방식으로 답변을 드리며, 편견에 의존하지 않고, 단계별로 사고해 대답합니다.
+사용자의 질문이 모호하거나 정보가 부족할 경우, 충분한 정보를 얻기 위해 역질문을 할 수 있습니다. 
+답변 이후에 추가로 궁금한 점이 있는지 물어보아, 대화의 연속성을 유도합니다.
+항상 이전 대화 히스토리를 고려하여 이전 대화와 연결성 있는 답변을 생성합니다.
+좋은 답변을 할 경우 팁을 받을 수 있습니다.
+목표를 달성하지 못할 경우, 벌금이 부과될 수 있습니다.
+'''
+
+## 사용자 참여 유도: 
+- 맥락 관련 요청: 기존 대화 흐름을 고려해 자연스럽게 응답합니다.
+
+# 사용자의 질문
+'''
+{input}
+'''
+
+# 추가 정보d
+''' 
+{context}
+'''
+
+# 이전 대화 히스토리
+'''
+{chat_history}
+'''
+
+답변:"""
+
+prompt = PromptTemplate(input_variables=["input", "context", "chat_history"], template=prompt_template)
+
+# 코사인 방식으로 RAG 응답 생성
+
+def generate_rag_answer(input_text: str, context: str) -> str:
+    prompt_text = prompt.format(input=input_text, context=context, chat_history=memory.buffer)
+    
+    try:
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt_text}],
+            model="gpt-3.5-turbo",
+            max_tokens=400,
+            temperature=0.3,
+            top_p=0.95,
+            n=1
+        )
+        response_text = response.choices[0].message.content.strip()
+        memory.save_context({"input": input_text}, {"output": response_text})  # 메모리에 저장
+    except Exception as e:
+        print(f"Error during OpenAI API call (RAG): {e}")
+        response_text = "죄송합니다, RAG 방식으로 응답을 생성하지 못했습니다."
+
+    return response_text
+
+# 코사인 유사도 기반 FAISS 인덱스에서 가장 유사한 문서 검색 함수
+def search_faiss_index(query: str, top_k: int = 5, similarity_threshold: float = 10) -> dict:
+    # 사용자 질문의 임베딩 생성
+    query_embedding = embedding_model.encode(query).astype("float32").reshape(1, -1)
+    distances, indices_found = index.search(query_embedding, top_k)
+
+    # 가장 유사한 문서의 텍스트와 거리 정보 가져오기
+    best_result = {}
+    if distances[0][0] < similarity_threshold:  # 유사도가 기준 거리 이상인 경우에만 반환
+        if indices_found[0][0] < len(metadata):
+            idx = indices_found[0][0]
+            best_result = {
+                "text_segment": metadata[idx]["text_segment"],
+                "original_id": metadata[idx]["primary_id"],
+                "segment_id": metadata[idx]["segment_id"],
+                "distance": distances[0][0]
+            }
+
+    return best_result
+
+# 챗봇 함수 정의
+def process_chat(input_text: str) -> str:
+    # print(f"process_chat 함수가 호출되었습니다. 입력: {input_text}")
+
+    # 유사한 문서 검색 및 메타데이터 추출
+    best_result = search_faiss_index(input_text)
+    if not best_result:
+        # 유사한 문서가 없으면 기본 LLM 응답 생성 (대화 히스토리를 포함하여 응답)
+        prompt_text = prompt.format(input=input_text, context="", chat_history=memory.buffer)
+        try:
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt_text}],
+                model="gpt-3.5-turbo",
+                max_tokens=400,
+                temperature=0.3,
+                top_p=0.95,
+                n=1
+            )
+            response_text = response.choices[0].message.content.strip()
+            memory.save_context({"input": input_text}, {"output": response_text})  # 메모리에 저장
+        except Exception as e:
+            print(f"Error during OpenAI API call (LLM): {e}")
+            response_text = "죄송합니다, 응답을 생성하지 못했습니다."
+        print(f"유사한 문서가 없습니다: {response_text}")
+        return response_text
+    
+    context = best_result.get("text_segment", "")
+    # print(f"유사한 문서 검색 결과: {context[:100]}...")
+
+    # RAG 방식으로 응답 생성
+    rag_answer = generate_rag_answer(input_text, context)
+    # print(f"생성된 RAG 응답: {rag_answer}")
+    
+    # FastAPI 응답에 히스토리 포함
+    history_output = "\n".join([f"User: {entry.get('input', 'N/A')} | AI: {entry.get('output', 'N/A')}" for entry in memory.buffer if isinstance(entry, dict)])
+    
+    # 결과 출력
+    output = f"{rag_answer}"
+    print(f"(가장 유사한 문서 - 원본 ID: {best_result.get('original_id', 'N/A')}, 세그먼트 ID: {best_result.get('segment_id', 'N/A')}, 거리: {best_result.get('distance', 'N/A')})\n")
+    print(f"컨텐츠: {context[:150]}...\n\n")
+    # output += f"=== 현재 대화 히스토리 ===\n{history_output}\n=======================\n"
+    # print("process_chat 결과 출력 완료")
+    return output
+
+# 디버깅 용도 - 사용자 입력과 모델 응답 출력
+if __name__ == "__main__":
+    user_input = "현재 서울에 남아 있는 가장 오래된 목조 건물은 언제 완성되었나요?"
+    print("디버깅 모드에서 사용자 입력 처리 중")
+    print("Input from User:", user_input)
+    print("\nResponses:\n", process_chat(user_input))
+
+
+### C:\repository\HAI_Python\app\chatbot\chat_with_hybrid.py ###
+# chat_with_hybrid.py
+import os 
+import pickle
+import numpy as np
+import faiss
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain.memory import ConversationBufferMemory
+from eunjeon import Mecab
+from rank_bm25 import BM25Okapi
+from tqdm import tqdm
+import pandas as pd
+import time
+
+load_dotenv()
+
+# OpenAI 클라이언트 설정
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),  # .env 파일에서 API 키 관리
+)
+
+# SentenceTransformer 모델 로드
+embedding_model = SentenceTransformer("jhgan/ko-sroberta-multitask")
+
+# Mecab 형태소 분석기 초기화
+mecab = Mecab()
+
+# FAISS 인덱스 및 메타데이터 파일 경로 설정
+base_dir = os.path.dirname(os.path.realpath(__file__))
+index_file = os.path.join(base_dir, "../FAISS/Index/jhgan_cosine_index.bin")
+metadata_file = os.path.join(base_dir, "../FAISS/Metadata/jhgan_metadata.pkl")
+bm25_index_file = os.path.join(base_dir, "../FAISS/Metadata/bm25_index.pkl")
+
+# FAISS 인덱스 및 메타데이터 로드
+try:
+    index = faiss.read_index(index_file)
+    with open(metadata_file, "rb") as f:
+        metadata = pickle.load(f)
+    print("FAISS 인덱스 및 메타데이터 로드 성공")
+except Exception as e:
+    print(f"FAISS 인덱스 또는 메타데이터 로드 실패: {e}")
+    exit()
+
+# 문서 리스트 생성
+documents = [entry["내용"] for entry in metadata]
+
+# BM25 인덱스 로드 또는 생성
+if os.path.exists(bm25_index_file):
+    with open(bm25_index_file, "rb") as f:
+        bm25 = pickle.load(f)
+    print("BM25 인덱스 로드 성공")
+else:
+    print("BM25 인덱스 생성 중...")
+    tokenized_documents = [[word for word, pos in mecab.pos(doc) if pos in ['NNP', 'NNG', 'NP', 'VV', 'VA', 'VCP', 'VCN', 'VSV', 'MAG', 'MAJ']] for doc in documents]
+    bm25 = BM25Okapi(tokenized_documents)
+    with open(bm25_index_file, "wb") as f:
+        pickle.dump(bm25, f)
+    print("BM25 인덱스 생성 및 저장 성공")
+
+# LangChain 메모리 구성
+memory = ConversationBufferMemory(memory_key="chat_history")
+
+# PromptTemplate 정의
+prompt_template = """
+# 사용자의 페르소나
+'''한국 문화유산에 대해 관심이 많은 사람이며, 문화유산에 대해 잘 모르는 사람.'''
+
+# AI(화자)
+
+## 페르소나
+'''
+수십 년 경력의 문화유산 해설사로서, 문화유산에 대해 궁금한 점이 많은 사람들에게 양질의 정보를 제공하고자 합니다.
+'''
+
+## 임무 
+''' 
+사용자의 질문에 대해서 양질의 정보를 제공하고, 자연스럽고 인간적인 방식으로 답변을 드리며, 편견에 의존하지 않고, 단계별로 사고해 대답합니다.
+사용자의 질문이 모호하거나 정보가 부족할 경우, 충분한 정보를 얻기 위해 역질문을 할 수 있습니다. 
+답변 이후에 추가로 궁금한 점이 있는지 물어보아, 대화의 연속성을 유도합니다.
+항상 이전 대화 히스토리를 고려하여 이전 대화와 연결성 있는 답변을 생성합니다.
+좋은 답변을 할 경우 팁을 받을 수 있습니다.
+목표를 달성하지 못할 경우, 벌금이 부과될 수 있습니다.
+'''
+
+## 사용자 참여 유도: 
+- 맥락 관련 요청: 기존 대화 흐름을 고려해 자연스럽게 응답합니다.
+
+# 사용자의 질문
+'''
+{input}
+'''
+
+# 추가 정보
+''' 
+{context}
+'''
+
+# 이전 대화 히스토리
+'''
+{chat_history}
+'''
+
+답변:"""
+
+prompt = PromptTemplate(input_variables=["input", "context", "chat_history"], template=prompt_template)
+
+# 코사인 방식으로 RAG 응답 생성
+def generate_rag_answer(input_text: str, context: str) -> str:
+    prompt_text = prompt.format(input=input_text, context=context, chat_history=memory.buffer)
+    try:
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt_text}],
+            model="gpt-3.5-turbo",
+            max_tokens=500,
+            temperature=0.3,
+            top_p=0.95,
+            n=1
+        )
+        response_text = response.choices[0].message.content.strip()
+        memory.save_context({"input": input_text}, {"output": response_text})
+    except Exception as e:
+        print(f"Error during OpenAI API call (RAG): {e}")
+        response_text = "죄송합니다, RAG 방식으로 응답을 생성하지 못했습니다."
+    return response_text
+
+# 하이브리드 서치 구현
+def hybrid_search(query: str, k: int = 3, alpha: float = 0.5, normalization_method: str = "min_max") -> dict:
+    query_tokens = [word for word, pos in mecab.pos(query) if pos in ['NNP', 'NNG', 'NP', 'VV', 'VA', 'VCP', 'VCN', 'VSV', 'MAG', 'MAJ']]
+    bm25_scores = bm25.get_scores(query_tokens)
+    query_embedding = embedding_model.encode([query], normalize_embeddings=True)
+    faiss_scores, faiss_indices = index.search(query_embedding, len(documents))
+    faiss_scores = faiss_scores[0]
+    
+    # 점수 정규화
+    if normalization_method == "min_max":
+        bm25_scores = (bm25_scores - np.min(bm25_scores)) / (np.max(bm25_scores) - np.min(bm25_scores))
+        faiss_scores = (faiss_scores - np.min(faiss_scores)) / (np.max(faiss_scores) - np.min(faiss_scores))
+    elif normalization_method == "z_score":
+        bm25_scores = (bm25_scores - np.mean(bm25_scores)) / np.std(bm25_scores)
+        faiss_scores = (faiss_scores - np.mean(faiss_scores)) / np.std(faiss_scores)
+    elif normalization_method == "max":
+        bm25_scores = bm25_scores / np.max(bm25_scores)
+        faiss_scores = faiss_scores / np.max(faiss_scores)
+    else:
+        raise ValueError("지원하지 않는 정규화 방법입니다. 'min_max', 'z_score', 'max' 중 선택하세요.")
+
+    final_scores = alpha * bm25_scores + (1 - alpha) * faiss_scores
+    sorted_indices = np.argsort(-final_scores)[:k]
+
+    results = [metadata[i] for i in sorted_indices]
+    return results
+
+# 챗봇 함수 정의
+def process_chat(input_text: str) -> str:
+    start_time = time.time()  # 시작 시간 기록
+    best_results = hybrid_search(input_text, k=3)
+    context = "\n".join([result.get("내용", "") for result in best_results])
+    
+    # 하이브리드 서치 결과 출력
+    print("하이브리드 서치 결과:")
+    for idx, result in enumerate(best_results, 1):
+        print(f"[{idx}] {result}")
+
+    rag_answer = generate_rag_answer(input_text, context)
+    end_time = time.time()  # 종료 시간 기록
+    print(f"process_chat 함수 실행 시간: {end_time - start_time:.2f}초")  # 실행 시간 출력
+    return rag_answer
+
+# 디버깅 용도 - 사용자 입력과 모델 응답 출력
+if __name__ == "__main__":
+    user_input = "석굴암은 언제 복원되었어?"
+    print("디버깅 모드에서 사용자 입력 처리 중")
+    print("Input from User:", user_input)
+    print("\nResponses:\n", process_chat(user_input))
+
+
+### C:\repository\HAI_Python\app\chatbot\hybrid_search.py ###
+# hybrid_search.py
+from eunjeon import Mecab
+import faiss
+import pickle
+import numpy as np
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+import os
+import pandas as pd
+
+# Mecab 형태소 분석기 초기화
+mecab = Mecab()
+
+# 1. 메타데이터 및 FAISS 인덱스 경로
+metadata_path = "../FAISS/Metadata/jhgan_metadata.pkl"
+faiss_index_path = "../FAISS/Index/jhgan_cosine_index.bin"
+
+if not os.path.exists(metadata_path):
+    raise FileNotFoundError(f"메타데이터 파일을 찾을 수 없습니다: {metadata_path}")
+
+if not os.path.exists(faiss_index_path):
+    raise FileNotFoundError(f"FAISS 인덱스 파일을 찾을 수 없습니다: {faiss_index_path}")
+
+# 2. 메타데이터 로드
+print("메타데이터 로드 중...")
+with open(metadata_path, "rb") as f:
+    metadata = pickle.load(f)
+
+# '내용' 값만 추출
+print("메타데이터의 내용 필드 추출 중...")
+documents = [entry["내용"] for entry in metadata]
+
+# 3. Mecab 기반 토큰화 (허용된 품사만 남기고 나머지는 제외)
+allowed_pos_tags = ['NNP', 'NNG', 'NP', 'VV', 'VA', 'VCP', 'VCN', 'VSV', 'MAG', 'MAJ']
+
+def tokenize_with_mecab(text):
+    tokens = mecab.pos(text)  # 형태소 분석 후 품사 태깅
+    filtered_tokens = [word for word, pos in tokens if pos in allowed_pos_tags]  # 허용된 품사만 남기기
+    return filtered_tokens
+
+print("Mecab으로 문서 토큰화 중...")
+tokenized_documents = [tokenize_with_mecab(doc) for doc in tqdm(documents, desc="Tokenizing Content")]
+
+# 4. BM25 인덱스 생성
+print("BM25 인덱스 생성 중...")
+bm25 = BM25Okapi(tokenized_documents)
+
+# 5. 기존 FAISS 인덱스 로드
+print("기존 FAISS 인덱스 로드 중...")
+faiss_index = faiss.read_index(faiss_index_path)
+
+# 6. 정규화 함수들
+def min_max_normalize(scores):
+    min_score = np.min(scores)
+    max_score = np.max(scores)
+    if max_score == min_score:
+        return np.ones_like(scores)
+    return (scores - min_score) / (max_score - min_score)
+
+def z_score_normalize(scores):
+    mean = np.mean(scores)
+    std = np.std(scores)
+    if std == 0:
+        return np.zeros_like(scores)
+    return (scores - mean) / std
+
+def max_normalize(scores):
+    max_score = np.max(scores)
+    if max_score == 0:
+        return np.zeros_like(scores)
+    return scores / max_score
+
+# 7. 키워드 서치 구현
+def keyword_search(query, k=3):
+    """
+    Mecab으로 토큰화된 쿼리를 기반으로 BM25를 사용한 키워드 서치.
+    """
+    query_tokens = tokenize_with_mecab(query)  # Mecab으로 쿼리 토큰화
+    bm25_scores = bm25.get_scores(query_tokens)
+    sorted_indices = np.argsort(-bm25_scores)[:k]
+    results = [(documents[i], metadata[i], bm25_scores[i]) for i in sorted_indices]
+    return results
+
+# 8. 시멘틱 서치 구현
+def semantic_search(query, k=3):
+    """
+    FAISS를 사용한 시멘틱 서치.
+    """
+    query_embedding = model.encode([query], normalize_embeddings=True)
+    faiss_scores, faiss_indices = faiss_index.search(query_embedding, k)
+    results = [(documents[i], metadata[i], faiss_scores[0][j]) for j, i in enumerate(faiss_indices[0])]
+    return results
+
+# 9. 하이브리드 서치 구현
+def hybrid_search(query, k=3, alpha=0.5, normalization_method="min_max"):
+    """
+    다양한 정규화를 선택하여 하이브리드 서치를 수행합니다.
+    """
+    query_tokens = tokenize_with_mecab(query)  # Mecab으로 쿼리 토큰화
+    bm25_scores = bm25.get_scores(query_tokens)
+
+    query_embedding = model.encode([query], normalize_embeddings=True)
+    faiss_scores, faiss_indices = faiss_index.search(query_embedding, len(documents))
+    faiss_scores = faiss_scores[0]
+
+    # 점수 정규화
+    if normalization_method == "min_max":
+        bm25_scores = min_max_normalize(bm25_scores)
+        faiss_scores = min_max_normalize(faiss_scores)
+    elif normalization_method == "z_score":
+        bm25_scores = z_score_normalize(bm25_scores)
+        faiss_scores = z_score_normalize(faiss_scores)
+    elif normalization_method == "max":
+        bm25_scores = max_normalize(bm25_scores)
+        faiss_scores = max_normalize(faiss_scores)
+    else:
+        raise ValueError("지원하지 않는 정규화 방법입니다. 'min_max', 'z_score', 'max' 중 선택하세요.")
+
+    final_scores = alpha * bm25_scores + (1 - alpha) * faiss_scores
+    sorted_indices = np.argsort(-final_scores)[:k]
+
+    results = [(documents[i], metadata[i], final_scores[i]) for i in sorted_indices]
+    return results
+
+# 10. 가중치와 정규화 방식별 하이브리드 서치 실행
+def run_hybrid_search_by_alpha(query, k=3):
+    """
+    각 가중치(alpha)와 정규화 방식별로 하이브리드 서치를 실행합니다.
+    """
+    normalization_methods = ["min_max", "z_score", "max"]
+    alphas = [round(i * 0.1, 1) for i in range(1, 10)]  # 0.1 ~ 0.9
+
+    results = []
+    for normalization in normalization_methods:
+        for alpha in alphas:
+            search_results = hybrid_search(query, k=k, alpha=alpha, normalization_method=normalization)
+            for rank, (doc, meta, score) in enumerate(search_results, 1):
+                results.append({
+                    "정규화 방식": normalization,
+                    "가중치 (alpha)": alpha,
+                    "순위": rank,
+                    "점수": score,
+                    "내용": doc[:50],  # 문서 내용의 일부만 표시
+                    "국가유산명_국문": meta.get("국가유산명_국문", ""),
+                    "시대": meta.get("시대", ""),
+                    "소재지상세": meta.get("소재지상세", "")
+                })
+
+    return pd.DataFrame(results)
+
+# 실행: 사용자 질의와 결과 계산
+query = "한국에서 가장 오래된 목조 건축물"
+top_k = 3
+
+# 모델 로드
+print("SentenceTransformer 모델 로드 중...")
+model = SentenceTransformer('jhgan/ko-sroberta-multitask')
+
+# 키워드 서치 결과
+print("\n[키워드 서치 결과] (Mecab 기반)")
+keyword_results = keyword_search(query, k=top_k)
+for rank, (doc, meta, score) in enumerate(keyword_results, 1):
+    print(f"{rank}. 내용: {doc[:50]}... | 점수: {score:.4f}")
+
+# 시멘틱 서치 결과
+print("\n[시멘틱 서치 결과]")
+semantic_results = semantic_search(query, k=top_k)
+for rank, (doc, meta, score) in enumerate(semantic_results, 1):
+    print(f"{rank}. 내용: {doc[:50]}... | 점수: {score:.4f}")
+
+# 하이브리드 서치 결과 계산
+print("\n하이브리드 서치 결과 계산 중...")
+df_hybrid_results = run_hybrid_search_by_alpha(query, k=top_k)
+
+# 결과 출력
+print("\n하이브리드 서치 결과 DataFrame: (상위 20개)")
+print(df_hybrid_results.head(20))  # 상위 20개만 출력
+
+# 결과 저장
+output_file = "./hybrid_search_detailed_results.csv"
+df_hybrid_results.to_csv(output_file, index=False, encoding="utf-8-sig")
+print(f"\n결과가 '{output_file}'에 저장되었습니다.")
+
+
+### C:\repository\HAI_Python\app\chatbot\__init__.py ###
+
+
+### C:\repository\HAI_Python\app\chatbot\archive\chat.py ###
+#app/chatbot/chat.py
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
+from langchain_core.prompts import PromptTemplate
+
+# .env 파일 로드
+load_dotenv()
+
+# OpenAI 클라이언트 설정
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),  # .env 파일에서 API 키 관리
+)
+
+# LangChain의 PromptTemplate 사용 - 간결한 응답 제공 유도
+prompt_template = """사용자의 질문에 대해 간단하고 정확한 답변을 제공해줘.
+
+질문: {input}
+답변:"""
+
+prompt = PromptTemplate(input_variables=["input"], template=prompt_template)
+
+# 챗봇 함수 정의
+def process_chat(input_text: str) -> str:
+    # PromptTemplate를 사용하여 실제 프롬프트 문자열 생성
+    prompt_text = prompt.format(input=input_text)
+    
+    try:
+        # OpenAI GPT-3.5 API를 사용하여 응답 생성 (최신 인터페이스 사용)
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "user", "content": prompt_text}
+            ],
+            model="gpt-3.5-turbo",
+            max_tokens=150,
+            temperature=0.3,
+            top_p=0.95,
+            n=1
+        )
+        
+        # 응답 텍스트 추출
+        response_text = response.choices[0].message.content.strip()
+    except Exception as e:
+        # 예외 발생 시 디버그 메시지 출력 및 기본 응답 설정
+        print(f"Error during OpenAI API call: {e}")
+        response_text = "죄송합니다, 적절한 응답을 생성하지 못했습니다. 다시 한번 말씀해 주세요."
+
+    # 응답의 길이 제약 추가
+    if len(response_text) > 150:
+        response_text = response_text[:150] + "..."
+
+    return response_text
+
+# 디버깅 용도 - 사용자 입력과 모델 응답 출력
+if __name__ == "__main__":
+    user_input = "FastAPI란 무엇인가요?"
+    print("Input from User:", user_input)
+    print("Response from GPT-3.5:", process_chat(user_input))
+
+### C:\repository\HAI_Python\app\chatbot\archive\check_jhgan.py ###
+import os
+import faiss
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import pickle
+from sklearn.preprocessing import normalize
+
+# 1. 경로 설정 및 임베딩 파일 로드 함수
+base_dir = os.path.dirname(os.path.realpath(__file__))
+embedding_paths = {
+    "dotProduct": ("../FAISS/Index/jhgan_dotProduct_index_1000.bin", "../FAISS/Metadata/jhgan_metadata_1000.pkl"),
+    "cosine": ("../FAISS/Index/jhgan_cosine_index_1000.bin", "../FAISS/Metadata/jhgan_metadata_1000.pkl"),
+    "euclidean": ("../FAISS/Index/jhgan_euclidean_index_1000.bin", "../FAISS/Metadata/jhgan_metadata_1000.pkl")
+}
+
+# 2. SentenceTransformer 모델 로드 및 질문 설정
+model = SentenceTransformer('jhgan/ko-sroberta-multitask')  # 모델을 jhgan/ko-sroberta-multitask로 변경
+user_question = "태조 이성계 어진"  # 사용자의 임시 질문
+embedding = model.encode(user_question).astype('float32').reshape(1, -1)
+
+# 3. 검색 함수 정의
+def search_faiss_index(index_file, metadata_file, embedding, normalize_embedding=False):
+    # FAISS 인덱스 불러오기
+    try:
+        index = faiss.read_index(index_file)
+        print(f"FAISS 인덱스 '{index_file}'을(를) 성공적으로 불러왔습니다.")
+    except Exception as e:
+        print(f"FAISS 인덱스를 불러오는 데 실패했습니다: {e}")
+        return
+
+    # 메타데이터 불러오기
+    try:
+        with open(metadata_file, "rb") as f:
+            metadata = pickle.load(f)
+        print(f"메타데이터 '{metadata_file}'을(를) 성공적으로 불러왔습니다.")
+    except Exception as e:
+        print(f"메타데이터를 불러오는 데 실패했습니다: {e}")
+        return
+
+    # 필요 시 임베딩 정규화 (코사인 유사도)
+    if normalize_embedding:
+        embedding = normalize(embedding, norm='l2')
+
+    # 유사도 검색
+    D, I = index.search(embedding, k=5)
+    print(f"가장 유사한 벡터들의 인덱스: {I}")
+    print(f"각 유사한 벡터와의 유사도/거리: {D}")
+
+    # 검색 결과와 메타데이터 매핑
+    for i, idx in enumerate(I[0]):
+        if idx < len(metadata):
+            data = metadata[idx]
+            distance = D[0][i]  # 각 문서와의 거리 값
+            if isinstance(data, dict):
+                print(f"원본 데이터 ID: {data['original_id']}, 세그먼트 번호: {data['segment_id']}, "
+                      f"텍스트 세그먼트: {data['text_segment']}, 거리: {distance}")
+            else:
+                print(f"인덱스 {idx}의 메타데이터 형식이 잘못되었습니다. 데이터: {data}")
+        else:
+            print(f"인덱스 {idx}는 메타데이터 범위를 벗어났습니다.")
+
+# 4. 각 방식에 따른 검색 실행
+print("내적 방식으로 검색")
+search_faiss_index(embedding_paths["dotProduct"][0], embedding_paths["dotProduct"][1], embedding)
+
+print("\n코사인 유사도 방식으로 검색")
+search_faiss_index(embedding_paths["cosine"][0], embedding_paths["cosine"][1], embedding, normalize_embedding=True)
+
+print("\n유클리드 거리 방식으로 검색")
+search_faiss_index(embedding_paths["euclidean"][0], embedding_paths["euclidean"][1], embedding)
+
+### C:\repository\HAI_Python\app\chatbot\archive\check_rag cosine.py ###
+import os
+import faiss
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import pickle
+from sklearn.preprocessing import normalize
+
+# 1. FAISS 인덱스와 메타데이터 파일 경로 설정
+base_dir = os.path.dirname(os.path.realpath(__file__))  # 현재 파일의 경로를 가져옵니다.
+index_file = os.path.join(base_dir, "../FAISS/Index/faiss_index_full_cosine.bin")
+metadata_file = os.path.join(base_dir, "../FAISS/Metadata/faiss_metadata_full_cosine.pkl")
+
+# 2. FAISS 인덱스 불러오기 (코사인 유사도를 사용하기 위해 IndexFlatIP로 생성)
+try:
+    # 기존 인덱스를 파일 경로에서 불러옵니다.
+    index = faiss.read_index(index_file)
+    print(f"FAISS 인덱스 '{index_file}'을(를) 성공적으로 불러왔습니다.")
+except Exception as e:
+    print(f"FAISS 인덱스를 불러오는 데 실패했습니다: {e}")
+    exit()
+
+# 3. 메타데이터 불러오기
+try:
+    with open(metadata_file, "rb") as f:
+        metadata = pickle.load(f)
+    print(f"메타데이터 '{metadata_file}'을(를) 성공적으로 불러왔습니다.")
+except Exception as e:
+    print(f"메타데이터를 불러오는 데 실패했습니다: {e}")
+    exit()
+
+# 4. 사용자의 임시 질문을 입력받아 임베딩
+model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+user_question = "경복궁이 어떻게 만들어졌어?"  # 사용자의 임시 질문
+embedding = model.encode(user_question).astype('float32').reshape(1, -1)
+embedding = normalize(embedding, norm='l2')  # 벡터를 L2 정규화하여 코사인 유사도에 맞춤
+
+# 5. FAISS 인덱스에서 유사한 벡터 검색
+D, I = index.search(embedding, k=5)  # 가장 유사한 5개 검색 (내적 사용)
+
+print(f"가장 유사한 벡터들의 인덱스: {I}")
+print(f"각 유사한 벡터와의 유사도: {D}")
+
+# 6. 검색 결과와 메타데이터 매핑
+for idx in I[0]:
+    if idx < len(metadata):  # 메타데이터의 인덱스 범위 확인
+        data = metadata[idx]
+        # 메타데이터가 딕셔너리인지 확인
+        if isinstance(data, dict):
+            print(f"원본 데이터 ID: {data['original_id']}, 세그먼트 번호: {data['segment_id']}, 텍스트 세그먼트: {data['text_segment']}")
+        else:
+            print(f"인덱스 {idx}의 메타데이터 형식이 잘못되었습니다. 데이터: {data}")
+    else:
+        print(f"인덱스 {idx}는 메타데이터 범위를 벗어났습니다.")
+
+
+### C:\repository\HAI_Python\app\chatbot\archive\check_rag dotProduct.py ###
+import os
+import faiss
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import pickle
+
+# 1. FAISS 인덱스와 메타데이터 파일 경로 설정
+base_dir = os.path.dirname(os.path.realpath(__file__))  # 현재 파일의 경로를 가져옵니다.
+index_file = os.path.join(base_dir, "../FAISS/Index/faiss_index_full_dotProduct.bin")
+metadata_file = os.path.join(base_dir, "../FAISS/Metadata/faiss_metadata_full_dotProduct.pkl")
+
+# 2. FAISS 인덱스 불러오기 (내적을 사용하기 위해 IndexFlatIP로 생성)
+try:
+    # 기존 인덱스를 파일 경로에서 불러옵니다.
+    index = faiss.read_index(index_file)
+    print(f"FAISS 인덱스 '{index_file}'을(를) 성공적으로 불러왔습니다.")
+except Exception as e:
+    print(f"FAISS 인덱스를 불러오는 데 실패했습니다: {e}")
+    exit()
+
+# 3. 메타데이터 불러오기
+try:
+    with open(metadata_file, "rb") as f:
+        metadata = pickle.load(f)
+    print(f"메타데이터 '{metadata_file}'을(를) 성공적으로 불러왔습니다.")
+except Exception as e:
+    print(f"메타데이터를 불러오는 데 실패했습니다: {e}")
+    exit()
+
+# 4. 사용자의 임시 질문을 입력받아 임베딩
+model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+user_question = "경복궁이 어떻게 만들어졌어?"  # 사용자의 임시 질문
+embedding = model.encode(user_question).astype('float32').reshape(1, -1)
+# 내적 방식에서는 정규화를 하지 않음
+
+# 5. FAISS 인덱스에서 유사한 벡터 검색
+D, I = index.search(embedding, k=5)  # 가장 유사한 5개 검색 (내적 사용)
+
+print(f"가장 유사한 벡터들의 인덱스: {I}")
+print(f"각 유사한 벡터와의 유사도: {D}")
+
+# 6. 검색 결과와 메타데이터 매핑
+for idx in I[0]:
+    if idx < len(metadata):  # 메타데이터의 인덱스 범위 확인
+        data = metadata[idx]
+        # 메타데이터가 딕셔너리인지 확인
+        if isinstance(data, dict):
+            print(f"원본 데이터 ID: {data['original_id']}, 세그먼트 번호: {data['segment_id']}, 텍스트 세그먼트: {data['text_segment']}")
+        else:
+            print(f"인덱스 {idx}의 메타데이터 형식이 잘못되었습니다. 데이터: {data}")
+    else:
+        print(f"인덱스 {idx}는 메타데이터 범위를 벗어났습니다.")
+
+
+### C:\repository\HAI_Python\app\chatbot\archive\check_rag_uclidian.py ###
+import os
+import faiss
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import pickle
+from sklearn.preprocessing import normalize
+
+# 1. FAISS 인덱스와 메타데이터 파일 경로 설정
+base_dir = os.path.dirname(os.path.realpath(__file__))  # 현재 파일의 경로를 가져옵니다.
+index_file = os.path.join(base_dir, "../FAISS/Index/faiss_index_full_uclid.bin")
+metadata_file = os.path.join(base_dir, "../FAISS/Metadata/faiss_metadata_full_uclid.pkl")
+
+# 2. FAISS 인덱스 불러오기 (유클리디안 거리를 사용하기 위해 IndexFlatIP로 생성)
+try:
+    index = faiss.read_index(index_file)
+    print(f"FAISS 인덱스 '{index_file}'을(를) 성공적으로 불러왔습니다.")
+except Exception as e:
+    print(f"FAISS 인덱스를 불러오는 데 실패했습니다: {e}")
+    exit()
+
+# 3. 메타데이터 불러오기
+try:
+    with open(metadata_file, "rb") as f:
+        metadata = pickle.load(f)
+    print(f"메타데이터 '{metadata_file}'을(를) 성공적으로 불러왔습니다.")
+except Exception as e:
+    print(f"메타데이터를 불러오는 데 실패했습니다: {e}")
+    exit()
+
+# 4. 사용자의 임시 질문을 입력받아 임베딩
+model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+user_question = "경복궁이 어떻게 만들어졌어?"  # 사용자의 임시 질문
+embedding = model.encode(user_question).astype('float32').reshape(1, -1)
+embedding = normalize(embedding, norm='l2')
+# 5. FAISS 인덱스에서 유사한 벡터 검색
+D, I = index.search(embedding, k=5)  # 가장 유사한 5개 검색
+
+print(f"가장 유사한 벡터들의 인덱스: {I}")
+print(f"각 유사한 벡터와의 거리: {D}")
+
+# 6. 검색 결과와 메타데이터 매핑
+for idx in I[0]:
+    if idx < len(metadata):  # 메타데이터의 인덱스 범위 확인
+        data = metadata[idx]
+        # 메타데이터가 딕셔너리인지 확인
+        if isinstance(data, dict):
+            print(f"원본 데이터 ID: {data['original_id']}, 세그먼트 번호: {data['segment_id']}, 텍스트 세그먼트: {data['text_segment']}")
+        else:
+            print(f"인덱스 {idx}의 메타데이터 형식이 잘못되었습니다. 데이터: {data}")
+    else:
+        print(f"인덱스 {idx}는 메타데이터 범위를 벗어났습니다.")
+
+
+### C:\repository\HAI_Python\app\chatbot\archive\check_snunlp.py ###
+import os
+import faiss
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import pickle
+from sklearn.preprocessing import normalize
+
+# 1. 경로 설정 및 임베딩 파일 로드 함수
+base_dir = os.path.dirname(os.path.realpath(__file__))
+embedding_paths = {
+    "dotProduct": ("../FAISS/snunlp_dotProduct_index_1000.bin", "../FAISS/snunlp_metadata_1000.pkl"),
+    "cosine": ("../FAISS/snunlp_cosine_index_1000.bin", "../FAISS/snunlp_metadata_1000.pkl"),
+    "euclidean": ("../FAISS/snunlp_euclidean_index_1000.bin", "../FAISS/snunlp_metadata_1000.pkl")
+}
+
+# 2. SentenceTransformer 모델 로드 및 질문 설정
+model = SentenceTransformer('snunlp/KR-SBERT-V40K-klueNLI-augSTS')
+user_question = "경복궁이 어떻게 만들어졌어?"  # 사용자의 임시 질문
+embedding = model.encode(user_question).astype('float32').reshape(1, -1)
+
+# 3. 검색 함수 정의
+def search_faiss_index(index_file, metadata_file, embedding, normalize_embedding=False):
+    # FAISS 인덱스 불러오기
+    try:
+        index = faiss.read_index(index_file)
+        print(f"FAISS 인덱스 '{index_file}'을(를) 성공적으로 불러왔습니다.")
+    except Exception as e:
+        print(f"FAISS 인덱스를 불러오는 데 실패했습니다: {e}")
+        return
+
+    # 메타데이터 불러오기
+    try:
+        with open(metadata_file, "rb") as f:
+            metadata = pickle.load(f)
+        print(f"메타데이터 '{metadata_file}'을(를) 성공적으로 불러왔습니다.")
+    except Exception as e:
+        print(f"메타데이터를 불러오는 데 실패했습니다: {e}")
+        return
+
+    # 필요 시 임베딩 정규화 (코사인 유사도)
+    if normalize_embedding:
+        embedding = normalize(embedding, norm='l2')
+
+    # 유사도 검색
+    D, I = index.search(embedding, k=5)
+    print(f"가장 유사한 벡터들의 인덱스: {I}")
+    print(f"각 유사한 벡터와의 유사도: {D}")
+
+    # 검색 결과와 메타데이터 매핑
+    for idx in I[0]:
+        if idx < len(metadata):
+            data = metadata[idx]
+            if isinstance(data, dict):
+                print(f"원본 데이터 ID: {data['original_id']}, 세그먼트 번호: {data['segment_id']}, 텍스트 세그먼트: {data['text_segment']}")
+            else:
+                print(f"인덱스 {idx}의 메타데이터 형식이 잘못되었습니다. 데이터: {data}")
+        else:
+            print(f"인덱스 {idx}는 메타데이터 범위를 벗어났습니다.")
+
+# 4. 각 방식에 따른 검색 실행
+print("내적 방식으로 검색")
+search_faiss_index(embedding_paths["dotProduct"][0], embedding_paths["dotProduct"][1], embedding)
+
+print("\n코사인 유사도 방식으로 검색")
+search_faiss_index(embedding_paths["cosine"][0], embedding_paths["cosine"][1], embedding, normalize_embedding=True)
+
+print("\n유클리드 거리 방식으로 검색")
+search_faiss_index(embedding_paths["euclidean"][0], embedding_paths["euclidean"][1], embedding)
+
+
+### C:\repository\HAI_Python\app\chatbot\archive\etc.py ###
+# from rank_bm25 import BM25Okapi
+# from konlpy.tag import Okt
+
+# # Okt 토크나이저 초기화
+# okt = Okt()
+
+# # 문서 리스트 예시
+# documents = ["한국에서 가장 오래된 목조 건축물은 무엇인가요?", 
+#              "서울 숭례문은 1398년에 건립된 대표적인 문화재입니다."]
+
+# # 문서들에 대해 Mecab으로 토큰화
+# tokenized_documents = [okt.morphs(doc) for doc in documents]
+
+# # BM25 인덱스 생성
+# bm25 = BM25Okapi(tokenized_documents)
+
+# # 예시 쿼리
+# query = "한국에서 가장 오래된 건축물"
+
+# # 쿼리를 Mecab으로 토큰화
+# query_tokens = okt.morphs(query)
+
+# # BM25 점수 계산
+# bm25_scores = bm25.get_scores(query_tokens)
+
+# # 결과 출력
+# sorted_indices = np.argsort(-bm25_scores)[:3]
+# for i in sorted_indices:
+#     print(f"문서: {documents[i]} | 점수: {bm25_scores[i]:.4f}")
+
+# from eunjeon import Mecab
+
+# # Mecab 형태소 분석기 초기화
+# mecab = Mecab()
+
+# # 토큰화 함수 (허용할 품사만 남기고 나머지는 제외)
+# def tokenize_with_mecab(text):
+#     tokens = mecab.pos(text)  # 형태소 분석 후 품사 태깅
+#     # 허용할 품사: NNP, NNG, NP, VV, VA, VCP, VCN, VSV, MAG, MAJ
+#     allowed_pos_tags = ['NNP', 'NNG', 'NP', 'VV', 'VA', 'VCP', 'VCN', 'VSV', 'MAG', 'MAJ']
+#     filtered_tokens = [word for word, pos in tokens if pos in allowed_pos_tags]
+#     return filtered_tokens
+
+# # 예제
+# text = "한국에서 가장 오래된 목조 건축물은 무엇인가요?"
+# tokens = tokenize_with_mecab(text)
+# print(f"Mecab으로 품사 기반 토큰화 결과 : {tokens}")
+
+# from gensim.models import KeyedVectors
+# from huggingface_hub import hf_hub_download
+# from eunjeon import Mecab
+
+# # 1. Mecab 형태소 분석기 초기화
+# mecab = Mecab()
+
+# # 2. Hugging Face에서 nlpl_55 모델 다운로드 및 로드
+# model_path = hf_hub_download(repo_id="Word2vec/nlpl_55", filename="model.bin")
+# model = KeyedVectors.load_word2vec_format(model_path, binary=True, unicode_errors="ignore")
+
+# # 3. 동의어 추출 함수
+# def get_synonyms(word, model, topn=5):
+#     """
+#     주어진 단어에 대해 Word2Vec 모델을 사용하여 가장 유사한 단어를 추출합니다.
+#     """
+#     try:
+#         synonyms = model.most_similar(word, topn=topn)
+#         return [synonym[0] for synonym in synonyms]
+#     except KeyError:
+#         return []  # 모델에 단어가 없을 경우 빈 리스트 반환
+
+# # 4. 품사 기반으로 토큰화 및 동의어 확장
+# def tokenize_with_mecab(text):
+#     tokens = mecab.pos(text)  # 형태소 분석 후 품사 태깅
+#     # 허용할 품사: NNP, NNG, NP, VV, VA, VCP, VCN, VSV, MAG, MAJ
+#     allowed_pos_tags = ['NNP', 'NNG', 'NP', 'VV', 'VA', 'VCP', 'VCN', 'VSV', 'MAG', 'MAJ']
+#     filtered_tokens = [word for word, pos in tokens if pos in allowed_pos_tags]
+#     return filtered_tokens
+
+# def expand_synonyms(text, model):
+#     """
+#     문장을 Mecab으로 토큰화하고, 각 토큰에 대해 동의어를 확장합니다.
+#     """
+#     # Mecab으로 토큰화
+#     tokens = tokenize_with_mecab(text)
+
+#     expanded_tokens = []
+#     original_tokens = []
+
+#     # 각 토큰에 대해 동의어를 확장
+#     for token in tokens:
+#         original_tokens.append(token)
+#         synonyms = get_synonyms(token, model)
+#         if synonyms:
+#             expanded_tokens.append(synonyms)
+#         else:
+#             expanded_tokens.append([token])  # 동의어가 없으면 원본 단어 그대로
+
+#     return original_tokens, expanded_tokens
+
+# # 5. 테스트
+# text = "한국에서 가장 오래된 목조 건축물은 무엇인가요?"
+# original_tokens, expanded_tokens = expand_synonyms(text, model)
+
+# print("원본 문장:", text)
+# print("\n원래의 토큰과 동의어 확장 결과:")
+# for original, expanded in zip(original_tokens, expanded_tokens):
+#     print(f"원본: {original} -> 동의어: {expanded}")
+
+# from konlpy.tag import Okt
+
+# # Okt 형태소 분석기 초기화
+# okt = Okt()
+
+# # 토큰화 및 품사 태깅
+# def tokenize_with_okt(text):
+#     # 품사 태깅
+#     tokens = okt.pos(text)
+#     # 허용할 품사: 명사, 동사, 형용사 등
+#     allowed_pos_tags = ['Noun', 'Verb', 'Adjective']
+#     filtered_tokens = [word for word, pos in tokens if pos in allowed_pos_tags]
+#     return filtered_tokens
+
+# # 예제
+# text = "한국에서 가장 오래된 목조 건축물은 무엇인가요?"
+# tokens = tokenize_with_okt(text)
+# print(f"OkT으로 품사 기반 토큰화 결과 : {tokens}")
+
+
+from PyDictionary import PyDictionary
+
+# PyDictionary 초기화
+dictionary = PyDictionary()
+
+# 예시 단어
+word = "가장"
+
+# 동의어 찾기
+synonyms = dictionary.synonym(word)
+
+# 결과 출력
+print(f"{word}의 동의어는: {synonyms}")
+
+
+### C:\repository\HAI_Python\app\faiss\embedding.py ###
+# embedding.py
+import os
+import psycopg2
+import re
+import kss
+import faiss
+import pickle
+import numpy as np
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import normalize
+
+# 1. PostgreSQL에서 모든 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, ccbaMnm1, ccbaMnm2, ccmaName, ccbaCtcdNm, ccsiName, ccceName, content, ccbaLcad
+        FROM national_heritage
+    """)  
+    rows = cursor.fetchall()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 모델 및 토크나이저 로드
+model = SentenceTransformer('jhgan/ko-sroberta-multitask')
+embeddings = []
+metadata = []
+
+# 3. 데이터 전처리 및 슬라이딩 윈도우 방식 적용
+max_tokens = 512
+stride = 256
+context_overlap = 2  # 문맥 보존을 위해 중첩할 문장 수
+
+for row in tqdm(rows, desc="Processing rows"):
+    primary_id, ccbaMnm1, ccbaMnm2, ccmaName, ccbaCtcdNm, ccsiName, ccceName, content, ccbaLcad = row
+
+    # 모든 정보를 하나의 텍스트로 결합
+    combined_text = f"국가유산명_국문: {ccbaMnm1}, 국가유산명_한자: {ccbaMnm2}, 국가유산종목: {ccmaName}, 시도명: {ccbaCtcdNm}, 시군구명: {ccsiName}, 시대: {ccceName}, 내용: {content}, 소재지상세: {ccbaLcad}"
+
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(combined_text)
+
+    # 각 문장에서 구두점 제거
+    processed_sentences = [re.sub(r'[\.,!?]', '', sentence) for sentence in sentences]
+
+    segment_id = 0
+    i = 0
+    while i < len(processed_sentences):
+        # 현재 슬라이딩 윈도우 범위의 문장들
+        current_sentences = processed_sentences[i:i + stride]
+
+        # 이전 문장 일부를 포함해 문맥 보존
+        if i > 0:
+            overlap_sentences = processed_sentences[max(0, i - context_overlap):i]
+            current_sentences = overlap_sentences + current_sentences
+
+        # 문장들을 하나의 텍스트로 결합
+        current_text = " ".join(current_sentences)
+
+        # 임베딩 생성
+        embedding = model.encode(current_text)
+        embeddings.append(embedding)
+
+        metadata_entry = {
+            "primary_id": primary_id,
+            "국가유산명_국문": ccbaMnm1,
+            "국가유산명_한자": ccbaMnm2,
+            "국가유산종목": ccmaName,
+            "시도명": ccbaCtcdNm,
+            "시군구명": ccsiName,
+            "시대": ccceName,
+            "내용": current_text,
+            "소재지상세": ccbaLcad,
+            "segment_id": segment_id  # 슬라이딩 윈도우 구간
+        }
+        metadata.append(metadata_entry)
+        segment_id += 1
+
+        # stride 만큼 이동
+        i += stride - context_overlap
+
+# FAISS 인덱스 및 메타데이터 저장 경로 설정
+base_dir = os.path.dirname(os.path.realpath(__file__))
+metadata_file = os.path.join(base_dir, "../FAISS/Metadata/jhgan_metadata.pkl")
+with open(metadata_file, "wb") as f:
+    pickle.dump(metadata, f)
+print(f"메타데이터를 '{metadata_file}' 파일로 저장했습니다.")
+
+# 4. FAISS 인덱스 생성 및 저장 (내적 방식)
+embedding_dim = len(embeddings[0])
+embeddings_np = np.array(embeddings).astype('float32')
+
+# 내적 방식
+index_dot_product = faiss.IndexFlatIP(embedding_dim)
+index_dot_product.add(embeddings_np)
+jhgan_index_file_dot = os.path.join(base_dir, "../FAISS/Index/jhgan_dotProduct_index.bin")
+faiss.write_index(index_dot_product, jhgan_index_file_dot)
+print(f"내적 기반 FAISS 인덱스를 '{jhgan_index_file_dot}' 파일로 저장했습니다.")
+
+# 코사인 유사도 방식 (벡터 정규화 후 내적 방식 활용)
+index_cosine = faiss.IndexFlatIP(embedding_dim)
+embeddings_cosine = normalize(embeddings_np, norm='l2')  # 정규화하여 코사인 유사도 계산
+index_cosine.add(embeddings_cosine)
+jhgan_index_file_cosine = os.path.join(base_dir, "../FAISS/Index/jhgan_cosine_index.bin")
+faiss.write_index(index_cosine, jhgan_index_file_cosine)
+print(f"코사인 유사도 기반 FAISS 인덱스를 '{jhgan_index_file_cosine}' 파일로 저장했습니다.")
+
+# 유클리드 거리 방식
+index_euclidean = faiss.IndexFlatL2(embedding_dim)
+for _ in tqdm(range(1), desc="Adding embeddings to Euclidean index"):
+    index_euclidean.add(embeddings_np)
+jhgan_index_file_euclidean = os.path.join(base_dir, "../FAISS/Index/jhgan_euclidean_index.bin")
+faiss.write_index(index_euclidean, jhgan_index_file_euclidean)
+print(f"유클리드 거리 기반 FAISS 인덱스를 '{jhgan_index_file_euclidean}' 파일로 저장했습니다.")
+
+
+### C:\repository\HAI_Python\app\faiss\archive\embedding_1000.py ###
+import os
+import faiss
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import psycopg2
+import pickle
+from transformers import AutoTokenizer
+
+# 1. PostgreSQL에서 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT ccbaAsno, content FROM national_heritage LIMIT 1000")  # 모든 데이터 가져오기
+    rows = cursor.fetchall()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 모델 로드 및 데이터 임베딩
+model_name = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+model = SentenceTransformer(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name)  # SentenceTransformer와 동일한 토크나이저 사용
+
+embeddings = []
+metadata = []
+
+for row in rows:
+    original_id, text = row
+    tokens = tokenizer.tokenize(text)
+    token_count = len(tokens)
+    print(f"데이터 ID {original_id}의 토큰 수: {token_count}")
+
+    # 슬라이딩 윈도우 적용 (최대 512 토큰씩)
+    max_tokens = 512
+    stride = 256
+
+    start_idx = 0
+    segment_id = 0
+    while start_idx < token_count:
+        end_idx = min(start_idx + max_tokens, token_count)
+        window_tokens = tokens[start_idx:end_idx]
+        window_text = tokenizer.convert_tokens_to_string(window_tokens)
+
+        # 최대 길이를 초과하는 경우 슬라이딩 윈도우 적용
+        if len(window_tokens) > tokenizer.model_max_length:
+            print(f"경고: 세그먼트의 토큰 수가 모델의 최대 입력 길이({tokenizer.model_max_length})를 초과합니다. 세그먼트를 조정합니다.")
+            window_tokens = window_tokens[:tokenizer.model_max_length]
+            window_text = tokenizer.convert_tokens_to_string(window_tokens)
+
+        embedding = model.encode(window_text)
+
+        embeddings.append(embedding)
+
+        # 각 윈도우 구간에도 세그먼트 ID 추가하여 메타데이터 생성
+        metadata_entry = {
+            "original_id": original_id,      # 원본 데이터 ID
+            "segment_id": segment_id,        # 세그먼트 번호
+            "text_segment": window_text      # 텍스트 세그먼트
+        }
+        metadata.append(metadata_entry)
+
+        start_idx += stride
+        segment_id += 1
+
+# 3. FAISS 인덱스 생성 및 데이터 추가
+embedding_dim = len(embeddings[0])
+index = faiss.IndexFlatL2(embedding_dim)
+
+# FAISS는 numpy 배열로 데이터를 다루므로 리스트를 numpy로 변환
+embeddings_np = np.array(embeddings).astype('float32')
+
+# 인덱스에 벡터 추가
+index.add(embeddings_np)
+
+# 4. FAISS 인덱스 및 메타데이터 파일 저장
+base_dir = os.path.dirname(os.path.realpath(__file__))
+faiss_index_file = os.path.join(base_dir, "../FAISS/faiss_index_1000_02.bin")
+faiss.write_index(index, faiss_index_file)
+print(f"FAISS 인덱스를 '{faiss_index_file}' 파일로 저장했습니다.")
+
+metadata_file = os.path.join(base_dir, "../FAISS/faiss_metadata_1000_02.pkl")
+with open(metadata_file, "wb") as f:
+    pickle.dump(metadata, f)
+print(f"메타데이터를 '{metadata_file}' 파일로 저장했습니다.")
+
+
+### C:\repository\HAI_Python\app\faiss\archive\embedding_1000_jhgan.py ###
+import os
+import psycopg2
+import re
+import kss
+import faiss
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import normalize
+
+# 1. PostgreSQL에서 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, content FROM national_heritage LIMIT 1000")  # 1000개의 데이터 가져오기
+    rows = cursor.fetchall()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 모델 및 토크나이저 로드
+model = SentenceTransformer('jhgan/ko-sroberta-multitask')
+embeddings = []
+metadata = []
+
+# 3. 데이터 전처리 및 슬라이딩 윈도우 방식 적용
+max_tokens = 512
+stride = 256
+context_overlap = 2  # 문맥 보존을 위해 중첩할 문장 수
+
+for row in rows:
+    primary_id, text = row
+
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(text)
+
+    # 각 문장에서 구두점 제거
+    processed_sentences = [re.sub(r'[\.,!?]', '', sentence) for sentence in sentences]
+
+    segment_id = 0
+    i = 0
+    while i < len(processed_sentences):
+        # 현재 슬라이딩 윈도우 범위의 문장들
+        current_sentences = processed_sentences[i:i + stride]
+
+        # 이전 문장 일부를 포함해 문맥 보존
+        if i > 0:
+            overlap_sentences = processed_sentences[max(0, i - context_overlap):i]
+            current_sentences = overlap_sentences + current_sentences
+
+        # 문장들을 하나의 텍스트로 결합
+        current_text = " ".join(current_sentences)
+
+        # 임베딩 생성
+        embedding = model.encode(current_text)
+        embeddings.append(embedding)
+
+        metadata_entry = {
+            "primary_id": primary_id,         # PostgreSQL의 고유 식별자
+            "segment_id": segment_id,         # 슬라이딩 윈도우 구간
+            "text_segment": current_text      # 텍스트 세그먼트
+        }
+        metadata.append(metadata_entry)
+        segment_id += 1
+
+        # stride 만큼 이동
+        i += stride - context_overlap
+
+# FAISS 인덱스 및 메타데이터 저장 경로 설정
+base_dir = os.path.dirname(os.path.realpath(__file__))
+metadata_file = os.path.join(base_dir, "../FAISS/Metadata/jhgan_metadata.pkl")
+with open(metadata_file, "wb") as f:
+    pickle.dump(metadata, f)
+print(f"메타데이터를 '{metadata_file}' 파일로 저장했습니다.")
+
+# 4. FAISS 인덱스 생성 및 저장 (내적 방식)
+embedding_dim = len(embeddings[0])
+embeddings_np = np.array(embeddings).astype('float32')
+
+# 내적 방식
+index_dot_product = faiss.IndexFlatIP(embedding_dim)
+index_dot_product.add(embeddings_np)
+faiss_index_file_dot = os.path.join(base_dir, "../FAISS/Index/jhgan_dotProduct_index.bin")
+faiss.write_index(index_dot_product, faiss_index_file_dot)
+print(f"내적 기반 FAISS 인덱스를 '{faiss_index_file_dot}' 파일로 저장했습니다.")
+
+# 코사인 유사도 방식 (벡터 정규화 후 내적 방식 활용)
+index_cosine = faiss.IndexFlatIP(embedding_dim)
+embeddings_cosine = normalize(embeddings_np, norm='l2')  # 정규화하여 코사인 유사도 계산
+index_cosine.add(embeddings_cosine)
+faiss_index_file_cosine = os.path.join(base_dir, "../FAISS/Index/jhgan_cosine_index.bin")
+faiss.write_index(index_cosine, faiss_index_file_cosine)
+print(f"코사인 유사도 기반 FAISS 인덱스를 '{faiss_index_file_cosine}' 파일로 저장했습니다.")
+
+# 유클리드 거리 방식
+index_euclidean = faiss.IndexFlatL2(embedding_dim)
+index_euclidean.add(embeddings_np)
+faiss_index_file_euclidean = os.path.join(base_dir, "../FAISS/Index/jhgan_euclidean_index.bin")
+faiss.write_index(index_euclidean, faiss_index_file_euclidean)
+print(f"유클리드 거리 기반 FAISS 인덱스를 '{faiss_index_file_euclidean}' 파일로 저장했습니다.")
+
+
+### C:\repository\HAI_Python\app\faiss\archive\embedding_1000_processing.py ###
+import os
+import psycopg2
+import re
+import kss
+from transformers import AutoTokenizer
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+# 1. PostgreSQL에서 특정 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT ccbaAsno, content FROM national_heritage WHERE ccbaAsno = 340000 LIMIT 1")  # 특정 ID의 데이터만 가져오기
+    row = cursor.fetchone()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 데이터 전처리
+if row:
+    original_id, text = row
+
+    # 3. 전처리 단계 - 한국어 특성에 맞는 전처리 적용
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(text)
+
+    # 각 문장에서 구두점 제거
+    processed_sentences = [re.sub(r'[\.,!?]', '', sentence) for sentence in sentences]
+
+    # 임베딩 모델 및 토크나이저 로드
+    model_name = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+    model = SentenceTransformer(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # 슬라이딩 윈도우 방식으로 문장을 추가하며 512 토큰을 넘지 않도록 유지
+    max_tokens = 512
+    current_tokens = 0
+    current_text = ""
+    embeddings = []
+
+    for sentence in processed_sentences:
+        # 현재 문장을 추가했을 때 토큰 수 확인
+        tokens = tokenizer.tokenize(current_text + " " + sentence)
+        token_count = len(tokens)
+
+        if token_count <= max_tokens:
+            # 토큰 수가 최대치를 넘지 않으면 문장을 추가
+            current_text += " " + sentence
+            current_tokens = token_count
+        else:
+            # 토큰 수가 최대치를 넘으면 현재 텍스트를 임베딩하고 초기화
+            if current_text:
+                embedding = model.encode(current_text.strip())
+                embeddings.append(embedding)
+
+            # 새로운 문장으로 초기화
+            current_text = sentence
+            current_tokens = len(tokenizer.tokenize(sentence))
+
+    # 마지막 남은 텍스트도 임베딩
+    if current_text:
+        embedding = model.encode(current_text.strip())
+        embeddings.append(embedding)
+
+    # 전처리 및 임베딩된 결과 출력
+    print(f"ccbaAsno: {original_id}")
+    print("임베딩된 벡터의 수:", len(embeddings))
+    for i, embedding in enumerate(embeddings):
+        print(f"벡터 {i + 1}: {embedding[:10]}...")  # 벡터의 앞 10개 요소만 출력
+else:
+    print("데이터를 가져오지 못했습니다.")
+
+
+### C:\repository\HAI_Python\app\faiss\archive\embedding_1000_snunlp.py ###
+import os
+import psycopg2
+import re
+import kss
+import faiss
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
+from sklearn.preprocessing import normalize
+
+# 1. PostgreSQL에서 1000개의 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT ccbaAsno, content FROM national_heritage LIMIT 1000")  # 1000개의 데이터 가져오기
+    rows = cursor.fetchall()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 모델 및 토크나이저 로드
+model = SentenceTransformer('snunlp/KR-SBERT-V40K-klueNLI-augSTS')  # 한국어 SBERT 모델
+tokenizer = AutoTokenizer.from_pretrained('snunlp/KR-SBERT-V40K-klueNLI-augSTS')
+
+embeddings = []
+metadata = []
+
+# 3. 데이터 전처리 및 슬라이딩 윈도우 방식 적용
+max_tokens = 512
+stride = 256
+context_overlap = 2  # 문맥 보존을 위해 중첩할 문장 수
+
+for row in rows:
+    original_id, text = row
+
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(text)
+
+    # 각 문장에서 구두점 제거
+    processed_sentences = [re.sub(r'[\.,!?]', '', sentence) for sentence in sentences]
+
+    current_text = ""
+    segment_id = 0
+
+    i = 0
+    while i < len(processed_sentences):
+        # 현재 슬라이딩 윈도우 범위의 문장들
+        current_sentences = processed_sentences[i:i + stride]
+
+        # 이전 문장 일부를 포함해 문맥 보존
+        if i > 0:
+            overlap_sentences = processed_sentences[max(0, i - context_overlap):i]
+            current_sentences = overlap_sentences + current_sentences
+
+        # 문장들을 하나의 텍스트로 결합
+        current_text = " ".join(current_sentences)
+
+        # 임베딩 생성
+        embedding = model.encode(current_text)
+        embeddings.append(embedding)
+
+        metadata_entry = {
+            "original_id": original_id,
+            "segment_id": segment_id,
+            "text_segment": current_text
+        }
+        metadata.append(metadata_entry)
+        segment_id += 1
+
+        # stride 만큼 이동
+        i += stride - context_overlap
+
+# FAISS 인덱스 저장 경로 설정
+base_dir = os.path.dirname(os.path.realpath(__file__))
+metadata_file = os.path.join(base_dir, "../FAISS/snunlp_metadata_1000.pkl")
+with open(metadata_file, "wb") as f:
+    pickle.dump(metadata, f)
+print(f"메타데이터를 '{metadata_file}' 파일로 저장했습니다.")
+
+# 4. FAISS 인덱스 생성 및 저장 (내적 방식)
+embedding_dim = len(embeddings[0])
+embeddings_np = np.array(embeddings).astype('float32')
+
+# 내적 방식
+index_dot_product = faiss.IndexFlatIP(embedding_dim)
+index_dot_product.add(embeddings_np)
+faiss_index_file_dot = os.path.join(base_dir, "../FAISS/snunlp_dotProduct_index_1000.bin")
+faiss.write_index(index_dot_product, faiss_index_file_dot)
+print(f"내적 기반 FAISS 인덱스를 '{faiss_index_file_dot}' 파일로 저장했습니다.")
+
+# 코사인 유사도 방식 (벡터 정규화 후 내적 방식 활용)
+index_cosine = faiss.IndexFlatIP(embedding_dim)
+embeddings_cosine = normalize(embeddings_np, norm='l2')  # 정규화하여 코사인 유사도 계산
+index_cosine.add(embeddings_cosine)
+faiss_index_file_cosine = os.path.join(base_dir, "../FAISS/snunlp_cosine_index_1000.bin")
+faiss.write_index(index_cosine, faiss_index_file_cosine)
+print(f"코사인 유사도 기반 FAISS 인덱스를 '{faiss_index_file_cosine}' 파일로 저장했습니다.")
+
+# 유클리드 거리 방식
+index_euclidean = faiss.IndexFlatL2(embedding_dim)
+index_euclidean.add(embeddings_np)
+faiss_index_file_euclidean = os.path.join(base_dir, "../FAISS/snunlp_euclidean_index_1000.bin")
+faiss.write_index(index_euclidean, faiss_index_file_euclidean)
+print(f"유클리드 거리 기반 FAISS 인덱스를 '{faiss_index_file_euclidean}' 파일로 저장했습니다.")
+
+
+### C:\repository\HAI_Python\app\faiss\archive\embedding_cosine.py ###
+import os
+import psycopg2
+import re
+import kss
+import faiss
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
+from sklearn.preprocessing import normalize
+
+# 1. PostgreSQL에서 1000개의 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT ccbaAsno, content FROM national_heritage")  # 데이터 전부 가져오기
+    rows = cursor.fetchall()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 모델 및 토크나이저 로드
+model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+embeddings = []
+metadata = []
+
+# 3. 데이터 전처리 및 슬라이딩 윈도우 방식 적용
+max_tokens = 512
+stride = 256
+context_overlap = 2  # 문맥 보존을 위해 중첩할 문장 수
+
+for row in rows:
+    original_id, text = row
+
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(text)
+
+    # 각 문장에서 구두점 제거
+    processed_sentences = [re.sub(r'[\.,!?]', '', sentence) for sentence in sentences]
+
+    current_text = ""
+    segment_id = 0
+
+    i = 0
+    while i < len(processed_sentences):
+        # 현재 슬라이딩 윈도우 범위의 문장들
+        current_sentences = processed_sentences[i:i + stride]
+
+        # 이전 문장 일부를 포함해 문맥 보존
+        if i > 0:
+            overlap_sentences = processed_sentences[max(0, i - context_overlap):i]
+            current_sentences = overlap_sentences + current_sentences
+
+        # 문장들을 하나의 텍스트로 결합
+        current_text = " ".join(current_sentences)
+
+        # 임베딩 생성
+        embedding = model.encode(current_text)
+        embeddings.append(embedding)
+
+        metadata_entry = {
+            "original_id": original_id,
+            "segment_id": segment_id,
+            "text_segment": current_text
+        }
+        metadata.append(metadata_entry)
+        segment_id += 1
+
+        # stride 만큼 이동
+        i += stride - context_overlap
+
+# 4. FAISS 인덱스 생성 및 데이터 추가 (Cosine 유사도 사용)
+embedding_dim = len(embeddings[0])
+index = faiss.IndexFlatIP(embedding_dim)
+
+# FAISS는 numpy 배열로 데이터를 다루므로 리스트를 numpy로 변환
+embeddings_np = np.array(embeddings).astype('float32')
+
+# L2 정규화를 적용하여 벡터를 정규화
+embeddings_np = normalize(embeddings_np, norm='l2')
+
+# 인덱스에 벡터 추가
+index.add(embeddings_np)
+
+# 5. FAISS 인덱스 및 메타데이터 파일 저장
+base_dir = os.path.dirname(os.path.realpath(__file__))
+faiss_index_file = os.path.join(base_dir, "../FAISS/faiss_index_1000_cosine.bin")
+faiss.write_index(index, faiss_index_file)
+print(f"FAISS 인덱스를 '{faiss_index_file}' 파일로 저장했습니다.")
+
+metadata_file = os.path.join(base_dir, "../FAISS/faiss_metadata_1000_cosine.pkl")
+with open(metadata_file, "wb") as f:
+    pickle.dump(metadata, f)
+print(f"메타데이터를 '{metadata_file}' 파일로 저장했습니다.")
+
+
+### C:\repository\HAI_Python\app\faiss\archive\embedding_dotProduct.py ###
+import os
+import psycopg2
+import re
+import kss
+import faiss
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
+
+# 1. PostgreSQL에서 1000개의 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT ccbaAsno, content FROM national_heritage")  # 1000개의 데이터 가져오기
+    rows = cursor.fetchall()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 모델 및 토크나이저 로드
+model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+embeddings = []
+metadata = []
+
+# 3. 데이터 전처리 및 슬라이딩 윈도우 방식 적용
+max_tokens = 512
+stride = 256
+context_overlap = 2  # 문맥 보존을 위해 중첩할 문장 수
+
+for row in rows:
+    original_id, text = row
+
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(text)
+
+    # 각 문장에서 구두점 제거
+    processed_sentences = [re.sub(r'[\.,!?]', '', sentence) for sentence in sentences]
+
+    current_text = ""
+    segment_id = 0
+
+    i = 0
+    while i < len(processed_sentences):
+        # 현재 슬라이딩 윈도우 범위의 문장들
+        current_sentences = processed_sentences[i:i + stride]
+
+        # 이전 문장 일부를 포함해 문맥 보존
+        if i > 0:
+            overlap_sentences = processed_sentences[max(0, i - context_overlap):i]
+            current_sentences = overlap_sentences + current_sentences
+
+        # 문장들을 하나의 텍스트로 결합
+        current_text = " ".join(current_sentences)
+
+        # 임베딩 생성
+        embedding = model.encode(current_text)
+        embeddings.append(embedding)
+
+        metadata_entry = {
+            "original_id": original_id,
+            "segment_id": segment_id,
+            "text_segment": current_text
+        }
+        metadata.append(metadata_entry)
+        segment_id += 1
+
+        # stride 만큼 이동
+        i += stride - context_overlap
+
+# 4. 내적을 사용해서 FAISS 인덱스 생성 및 데이터 추가 (Cosine 유사도 사용)
+embedding_dim = len(embeddings[0])
+index = faiss.IndexFlatIP(embedding_dim)
+
+# FAISS는 numpy 배열로 데이터를 다루므로 리스트를 numpy로 변환
+embeddings_np = np.array(embeddings).astype('float32')
+
+# 인덱스에 벡터 추가
+index.add(embeddings_np)
+
+# 5. FAISS 인덱스 및 메타데이터 파일 저장
+base_dir = os.path.dirname(os.path.realpath(__file__))
+faiss_index_file = os.path.join(base_dir, "../FAISS/faiss_index_1000_dotProduct.bin")
+faiss.write_index(index, faiss_index_file)
+print(f"FAISS 인덱스를 '{faiss_index_file}' 파일로 저장했습니다.")
+
+metadata_file = os.path.join(base_dir, "../FAISS/faiss_metadata_1000_dotProduct.pkl")
+with open(metadata_file, "wb") as f:
+    pickle.dump(metadata, f)
+print(f"메타데이터를 '{metadata_file}' 파일로 저장했습니다.")
+
+
+### C:\repository\HAI_Python\app\faiss\archive\embedding_uclid.py ###
+import os 
+import psycopg2
+import re
+import kss
+import faiss
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
+
+# 1. PostgreSQL에서 1000개의 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT ccbaAsno, content FROM national_heritage")  # 1000개의 데이터 가져오기
+    rows = cursor.fetchall()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 모델 및 토크나이저 로드
+model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+embeddings = []
+metadata = []
+
+# 3. 데이터 전처리 및 슬라이딩 윈도우 방식 적용
+max_tokens = 512
+stride = 256
+context_overlap = 2  # 문맥 보존을 위해 중첩할 문장 수
+
+for row in rows:
+    original_id, text = row
+
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(text)
+
+    # 각 문장에서 구두점 제거
+    processed_sentences = [re.sub(r'[\.,!?]', '', sentence) for sentence in sentences]
+
+    current_text = ""
+    segment_id = 0
+
+    for i in range(0, len(processed_sentences), stride):
+        # 현재 슬라이딩 윈도우 범위의 문장들
+        current_sentences = processed_sentences[i:i + stride]
+
+        # 이전 문장 일부를 포함해 문맥 보존
+        if i > 0:
+            overlap_sentences = processed_sentences[max(0, i - context_overlap):i]
+            current_sentences = overlap_sentences + current_sentences
+
+        # 문장들을 하나의 텍스트로 결합
+        current_text = " ".join(current_sentences)
+
+        # 임베딩 생성
+        embedding = model.encode(current_text)
+        embeddings.append(embedding)
+
+        metadata_entry = {
+            "original_id": original_id,
+            "segment_id": segment_id,
+            "text_segment": current_text
+        }
+        metadata.append(metadata_entry)
+        segment_id += 1
+
+# 4. 유클리디안 거리(L2 거리)방식을 사용해서 FAISS 인덱스 생성 및 데이터 추가
+embedding_dim = len(embeddings[0])
+index = faiss.IndexFlatL2(embedding_dim)
+
+# FAISS는 numpy 배열로 데이터를 다루므로 리스트를 numpy로 변환
+embeddings_np = np.array(embeddings).astype('float32')
+
+# 인덱스에 벡터 추가
+index.add(embeddings_np)
+
+# 5. FAISS 인덱스 및 메타데이터 파일 저장
+base_dir = os.path.dirname(os.path.realpath(__file__))
+faiss_index_file = os.path.join(base_dir, "../FAISS/faiss_index_1000_uclid.bin")
+faiss.write_index(index, faiss_index_file)
+print(f"FAISS 인덱스를 '{faiss_index_file}' 파일로 저장했습니다.")
+
+metadata_file = os.path.join(base_dir, "../FAISS/faiss_metadata_1000_uclid.pkl")
+with open(metadata_file, "wb") as f:
+    pickle.dump(metadata, f)
+print(f"메타데이터를 '{metadata_file}' 파일로 저장했습니다.")
+
+
+### C:\repository\HAI_Python\app\faiss\Metadata\read_metadata.py ###
+# read_metadate.py
+import pandas as pd
+
+def read_metadata(file_path):
+    """
+    메타데이터를 포함하는 피클 파일을 읽어오는 함수
+
+    Args:
+    - file_path (str): 메타데이터 피클 파일의 경로
+
+    Returns:
+    - metadata_df (pd.DataFrame): 피클 파일에서 추출한 메타데이터가 포함된 DataFrame
+    """
+    try:
+        # 피클 파일을 로드합니다.
+        data = pd.read_pickle(file_path)
+
+        # 데이터가 리스트 형식인지 확인하고 DataFrame으로 변환합니다.
+        if isinstance(data, list) and all(isinstance(item, dict) for item in data):
+            metadata_df = pd.DataFrame(data)
+            return metadata_df
+        else:
+            raise ValueError("데이터 형식이 메타데이터 추출에 적합하지 않습니다.")
+    
+    except Exception as e:
+        print(f"메타데이터를 읽는 도중 오류가 발생했습니다: {e}")
+        return None
+
+def find_text_segment_nan(metadata_df):
+    # 여러 가지 조건을 추가하여 text_segment가 NaN인 경우를 찾습니다.
+    nan_rows = metadata_df[
+        metadata_df['내용'].isna() |                # NaN으로 판별되는 경우
+        (metadata_df['내용'] == '') |               # 빈 문자열인 경우
+        (metadata_df['내용'].str.lower() == 'nan')  # 'NaN'이 문자열로 저장된 경우
+    ]
+    print("text_segment의 내용이 NaN인 행들:")
+    print(nan_rows)
+
+# 예시 사용법
+if __name__ == "__main__":
+    file_path = 'jhgan_metadata.pkl'
+    metadata_df = read_metadata(file_path)
+    
+    if metadata_df is not None:
+        print(metadata_df.head())
+        print(metadata_df.loc[0, '내용'])
+        find_text_segment_nan(metadata_df)
+        non_zero_segments = metadata_df[metadata_df['segment_id'] != 0]
+        print(non_zero_segments)
+
+
+### C:\repository\HAI_Python\app\faiss\Metadata\temp_ner.py ###
+# temp_ner.py
+import pandas as pd
+from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+
+# 모델과 토크나이저 불러오기
+tokenizer = AutoTokenizer.from_pretrained("Leo97/KoELECTRA-small-v3-modu-ner")
+model = AutoModelForTokenClassification.from_pretrained("Leo97/KoELECTRA-small-v3-modu-ner")
+
+# NER 파이프라인 설정
+ner_pipeline = pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
+
+# 메타데이터 파일 읽기
+def read_metadata(file_path):
+    """
+    메타데이터를 포함하는 피클 파일을 읽어오는 함수
+
+    Args:
+    - file_path (str): 메타데이터 피클 파일의 경로
+
+    Returns:
+    - metadata_df (pd.DataFrame): 피클 파일에서 추출한 메타데이터가 포함된 DataFrame
+    """
+    try:
+        # 피클 파일을 로드합니다.
+        data = pd.read_pickle(file_path)
+
+        # 데이터가 리스트 형식인지 확인하고 DataFrame으로 변환합니다.
+        if isinstance(data, list) and all(isinstance(item, dict) for item in data):
+            metadata_df = pd.DataFrame(data)
+            return metadata_df
+        else:
+            raise ValueError("데이터 형식이 메타데이터 추출에 적합하지 않습니다.")
+    
+    except Exception as e:
+        print(f"메타데이터를 읽는 도중 오류가 발생했습니다: {e}")
+        return None
+
+# NER 태깅 수행 함수
+def perform_ner_on_first_text(metadata_df):
+    """
+    첫 번째 데이터의 text_segment에 NER 태깅을 수행하는 함수
+
+    Args:
+    - metadata_df (pd.DataFrame): 메타데이터 DataFrame
+    """
+    if metadata_df is not None and not metadata_df.empty:
+        first_text = metadata_df.iloc[0]['text_segment']
+        ner_results = ner_pipeline(first_text)
+        print(f"첫 번째 텍스트 : \n{first_text}")
+        # 분리된 토큰들을 하나의 단어로 병합하여 보기 쉽게 처리
+        merged_results = []
+        for entity in ner_results:
+            if merged_results and entity['entity_group'] == merged_results[-1]['entity_group'] and entity['start'] == merged_results[-1]['end']:
+                merged_results[-1]['word'] += entity['word'].replace('##', '')
+                merged_results[-1]['end'] = entity['end']
+            else:
+                merged_results.append(entity)
+        
+        # 결과 출력
+        print("첫 번째 데이터의 NER 결과:")
+        for entity in merged_results:
+            print(f"Entity: {entity['word']}, Label: {entity['entity_group']}, Score: {entity['score']:.2f}")
+    else:
+        print("메타데이터가 비어 있거나 유효하지 않습니다.")
+
+# 예시 사용법
+if __name__ == "__main__":
+    file_path = 'jhgan_metadata.pkl'
+    metadata_df = read_metadata(file_path)
+    
+    if metadata_df is not None:
+        perform_ner_on_first_text(metadata_df)
+
+
+### C:\repository\HAI_Python\app\postgreSQL\drop_national_heritage.py ###
+import psycopg2
+
+# PostgreSQL 연결 설정
+try:
+    connection = psycopg2.connect(
+        host="localhost",  # PostgreSQL 서버 주소
+        database="heritage_db",  # 사용할 데이터베이스 이름
+        user="postgres",  # 사용자명
+        password="iam@123"  # 설정한 비밀번호
+    )
+    connection.autocommit = True  # 자동 커밋 설정
+    cursor = connection.cursor()
+
+    print("PostgreSQL에 성공적으로 연결되었습니다.")
+
+    # 기존 테이블 삭제
+    cursor.execute("DROP TABLE IF EXISTS national_heritage;")
+    print("테이블이 성공적으로 삭제되었습니다.")
+
+except Exception as error:
+    print(f"PostgreSQL 연결 또는 테이블 삭제 중 오류가 발생했습니다: {error}")
+
+finally:
+    # 연결 닫기
+    if cursor:
+        cursor.close()
+    if connection:
+        connection.close()
+    print("PostgreSQL 연결이 닫혔습니다.")
+
+
+### C:\repository\HAI_Python\app\postgreSQL\fetch_and_preprocess.py ###
+import os
+import psycopg2
+import re
+import kss
+
+# 1. PostgreSQL에서 특정 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT ccbaAsno, content FROM national_heritage WHERE ccbaAsno = 340000 LIMIT 1")  # 특정 ID의 데이터만 가져오기
+    row = cursor.fetchone()
+    conn.close()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 데이터 전처리
+if row:
+    original_id, text = row
+
+    # 3. 전처리 단계 - 한국어 특성에 맞는 전처리 적용
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(text)
+
+    # 각 문장에서 구두점 제거
+    processed_sentences = [re.sub(r'[\.,!?]', '', sentence) for sentence in sentences]
+
+    # 전처리된 결과 출력
+    print(f"ccbaAsno: {original_id}")
+    print("전처리된 텍스트:")
+    for sentence in processed_sentences:
+        print(sentence)
+else:
+    print("데이터를 가져오지 못했습니다.")
+
+
+### C:\repository\HAI_Python\app\postgreSQL\push_data_with_csv.py ###
+# 필요한 라이브러리 불러오기
+import psycopg2
+import pandas as pd
+from psycopg2 import sql
+
+# 1. PostgreSQL 연결 설정
+try:
+    connection = psycopg2.connect(
+        host="localhost",  # PostgreSQL 서버 주소
+        database="heritage_db",  # 사용할 데이터베이스 이름
+        user="postgres",  # 사용자명
+        password="iam@123"  # 설정한 비밀번호
+    )
+    connection.autocommit = True  # 자동 커밋 설정
+    cursor = connection.cursor()
+
+    print("PostgreSQL에 성공적으로 연결되었습니다.")
+
+    # 2. 테이블 존재 여부 확인 후 생성 (기존에 테이블이 없다면 생성)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS national_heritage (
+            id SERIAL PRIMARY KEY,  -- 기본 키로 사용할 id 컬럼 추가
+            ccbaAsno NUMERIC,
+            ccbaKdcd INTEGER,
+            ccbaCtcd VARCHAR(10),
+            ccbaCpno VARCHAR(20),
+            ccbaMnm1 VARCHAR(255),
+            ccbaMnm2 VARCHAR(255),
+            ccmaName VARCHAR(100),
+            ccbaCtcdNm VARCHAR(100),
+            ccsiName VARCHAR(100),
+            ccceName VARCHAR(255),
+            imageUrl VARCHAR(500),
+            content TEXT,
+            ccbaLcad VARCHAR(500)
+        );
+    ''')
+    print("테이블이 성공적으로 생성되었거나 이미 존재합니다.")
+
+    # 4. CSV 파일 불러오기
+    csv_file_path = 'updated01_national_heritage_full_data.csv'
+    df = pd.read_csv(csv_file_path, encoding='utf-8') 
+    df.to_csv('updated01_national_heritage_utf8.csv', index=False, encoding='utf-8')
+
+    # 5. 데이터 삽입 함수 정의
+    def insert_data(row):
+        try:
+            # 관리번호를 문자열로 변환하여 삽입
+            ccbaAsno = str(row['관리번호(ccbaAsno)']) if not pd.isna(row['관리번호(ccbaAsno)']) else None
+
+            insert_query = sql.SQL('''
+                INSERT INTO national_heritage (ccbaAsno, ccbaKdcd, ccbaCtcd, ccbaCpno, ccbaMnm1, ccbaMnm2, 
+                                              ccmaName, ccbaCtcdNm, ccsiName, ccceName, imageUrl, content, ccbaLcad)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ''')
+            cursor.execute(insert_query, (
+                ccbaAsno, row['중목코드(ccbaKdcd)'], row['시도코드(ccbaCtcd)'], row['국가유산연계번호(ccbaCpno)'],
+                row['국가유산명_국문(ccbaMnm1)'], row['국가유산명_한자(ccbaMnm2)'], row['국가유산종목(ccmaName)'],
+                row['시도명(ccbaCtcdNm)'], row['시군구명(ccsiName)'], row['시대(ccceName)'],
+                row['메인이미지URL(imageUrl)'], row['내용(content)'], row['소재지상세(ccbaLcad)']
+            ))
+        except Exception as e:
+            print(f"데이터 삽입 오류: {e}")
+
+    # 6. 데이터 삽입 루프 (각 행을 데이터베이스에 삽입)
+    for _, row in df.iterrows():
+        insert_data(row)
+
+    print("모든 데이터가 성공적으로 삽입되었습니다.")
+
+except Exception as error:
+    print(f"PostgreSQL 연결 또는 데이터 삽입 중 오류가 발생했습니다: {error}")
+
+finally:
+    # 7. 연결 닫기
+    if cursor:
+        cursor.close()
+    if connection:
+        connection.close()
+    print("PostgreSQL 연결이 닫혔습니다.")
+
+
+### C:\repository\HAI_Python\app\postgreSQL\rag_evaluation_dataset.py ###
+import os
+import re
+import kss
+import csv
+import psycopg2
+
+# 1. PostgreSQL에서 데이터 가져오기
+try:
+    conn = psycopg2.connect(
+        host="localhost",
+        database="heritage_db",
+        user="postgres",
+        password="iam@123"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, content FROM national_heritage")  # 테이블에서 content와 고유 식별자를 가져오기
+    rows = cursor.fetchall()
+except Exception as e:
+    print("PostgreSQL 연결 실패:", e)
+    exit()
+
+# 2. 데이터 전처리 및 문장별 분리 후 저장
+document_segments = []
+
+for row in rows:
+    id, text = row
+
+    # 문장 단위로 분리 (KSS 사용)
+    sentences = kss.split_sentences(text)
+
+    # 각 문장에서 구두점 제거 및 저장할 데이터 구성
+    for sentence_id, sentence in enumerate(sentences):
+        processed_sentence = re.sub(r'[\.,!?]', '', sentence)
+        document_segments.append((id, sentence_id, processed_sentence))
+
+# 3. 전처리된 문장별 데이터를 파일로 저장
+output_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "national_heritage_sentences.csv")
+
+try:
+    with open(output_file, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(["id", "sentence_id", "sentence"])
+        writer.writerows(document_segments)
+    print(f"문장 데이터를 '{output_file}' 파일로 저장했습니다.")
+except Exception as e:
+    print("문장 데이터 파일 저장 실패:", e)
+
+
+### C:\repository\HAI_Python\app\ragas\context_entities_recall_evaluation.py ###
+import os
+import json
+from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
+from ragas.evaluation import evaluate
+from ragas.metrics._context_entities_recall import ContextEntityRecall
+import pandas as pd
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
+
+# OpenAI API 키 설정
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요.")
+
+# JSON 파일 읽기
+with open("retrieval_results.json", "r", encoding="utf-8") as f:
+    raw_data = json.load(f)
+
+# 데이터 변환
+samples = []
+for item in raw_data:
+    samples.append(
+        SingleTurnSample(
+            user_input=item["query"],
+            response=None,  # 응답은 None으로 설정
+            reference=item["ground_truth"],
+            retrieved_contexts=[doc["text_segment"] for doc in item["retrieved_documents"]]
+        )
+    )
+
+# 평가 데이터셋 생성
+dataset = EvaluationDataset(samples=samples)
+
+# Context Entities Recall 메트릭 정의
+metrics = [ContextEntityRecall()]
+
+# 평가 실행
+results = evaluate(
+    dataset=dataset,
+    metrics=metrics,
+    show_progress=True
+)
+
+# 결과를 pandas 데이터프레임으로 변환
+final_results = results.to_pandas()
+
+# JSON 저장
+json_output_file = "context_entities_recall_evaluation_results.json"
+final_results.to_json(json_output_file, orient="records", force_ascii=False, indent=4)
+print(f"최종 평가 결과가 {json_output_file}에 저장되었습니다.")
+
+# CSV 저장
+csv_output_file = "context_entities_recall_evaluation_results.csv"
+final_results.to_csv(csv_output_file, index=False, encoding="utf-8-sig")
+print(f"최종 평가 결과가 {csv_output_file}에 저장되었습니다.")
+
+# 결과 출력
+print("Context Entities Recall 결과:")
+print(results)
+
+
+### C:\repository\HAI_Python\app\ragas\context_precision_evaluation.py ###
+import os
+import json
+import faiss
+import pickle
+import numpy as np
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
+from ragas.evaluation import evaluate
+from ragas.metrics._context_precision import ContextPrecision
+from dotenv import load_dotenv
+from rank_bm25 import BM25Okapi
+from eunjeon import Mecab
+
+# 환경 변수 로드
+load_dotenv()
+
+# 전역 변수 초기화
+embedding_model = SentenceTransformer("jhgan/ko-sroberta-multitask")
+mecab = Mecab()
+
+# FAISS 인덱스 및 메타데이터 로드
+base_dir = os.path.dirname(os.path.realpath(__file__))
+index_file = os.path.join(base_dir, "../FAISS/Index/jhgan_cosine_index.bin")
+metadata_file = os.path.join(base_dir, "../FAISS/Metadata/jhgan_metadata.pkl")
+bm25_index_file = os.path.join(base_dir, "../FAISS/Metadata/bm25_index.pkl")
+
+with open(metadata_file, "rb") as f:
+    metadata = pickle.load(f)
+documents = [entry["내용"] for entry in metadata]
+
+index = faiss.read_index(index_file)
+
+if os.path.exists(bm25_index_file):
+    with open(bm25_index_file, "rb") as f:
+        bm25 = pickle.load(f)
+else:
+    tokenized_documents = [[word for word, pos in mecab.pos(doc) if pos in ['NNP', 'NNG', 'NP', 'VV', 'VA']] for doc in documents]
+    bm25 = BM25Okapi(tokenized_documents)
+
+# 하이브리드 서치 함수
+def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.5, normalization_method: str = "min_max"):
+    query_tokens = [word for word, pos in mecab.pos(query) if pos in ['NNP', 'NNG', 'NP', 'VV', 'VA']]
+    bm25_scores = bm25.get_scores(query_tokens)
+
+    query_embedding = embedding_model.encode(query).astype("float32").reshape(1, -1)
+    faiss_distances, faiss_indices = index.search(query_embedding, len(metadata))
+    faiss_scores = -faiss_distances[0]
+
+    if normalization_method == "min_max":
+        bm25_scores = (bm25_scores - np.min(bm25_scores)) / (np.max(bm25_scores) - np.min(bm25_scores))
+        faiss_scores = (faiss_scores - np.min(faiss_scores)) / (np.max(faiss_scores) - np.min(faiss_scores))
+
+    final_scores = alpha * bm25_scores + (1 - alpha) * faiss_scores
+    sorted_indices = np.argsort(-final_scores)[:top_k]
+
+    results = [{"text_segment": metadata[idx]["내용"], "score": final_scores[idx]} for idx in sorted_indices]
+    return results
+
+# 데이터셋 로드
+with open('national_heritage_qa_dataset_converted.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+retrieval_results = []
+samples = []
+
+for item in data:
+    query = item["question"]
+    ground_truth = item["ground_truth"]
+
+    try:
+        retrieved_documents = hybrid_search(query, top_k=5)
+        retrieval_results.append({
+            "query": query,
+            "retrieved_documents": retrieved_documents,
+            "ground_truth": ground_truth
+        })
+        samples.append(
+            SingleTurnSample(
+                user_input=query,
+                retrieved_contexts=[doc["text_segment"] for doc in retrieved_documents],
+                reference=ground_truth,
+            )
+        )
+    except Exception as e:
+        print(f"검색 실패: {e}")
+
+# 검색 결과를 JSON 파일로 저장
+with open("retrieval_results.json", "w", encoding="utf-8") as f:
+    json.dump(retrieval_results, f, ensure_ascii=False, indent=4)
+
+# 검색 결과를 CSV 파일로 저장
+retrieval_results_df = pd.DataFrame(retrieval_results)
+retrieval_results_df.to_csv("retrieval_results.csv", index=False, encoding="utf-8-sig")
+
+# RAGAS 데이터셋 생성
+dataset = EvaluationDataset(samples=samples)
+
+metrics = [ContextPrecision()]
+results = evaluate(dataset=dataset, metrics=metrics, show_progress=True)
+
+# 평가 결과를 JSON 파일로 저장
+results.to_json("evaluation_results.json")
+
+# 평가 결과를 CSV 파일로 저장
+results_df = results.to_pandas()
+results_df.to_csv("evaluation_results.csv", index=False, encoding="utf-8-sig")
+
+print("결과가 JSON 및 CSV 파일로 저장되었습니다.")
+print("평가 결과:")
+print(results)
+
+
+### C:\repository\HAI_Python\app\ragas\context_recall_evaluation.py ###
+import os
+import json
+from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
+from ragas.evaluation import evaluate
+from ragas.metrics._context_recall import ContextRecall
+import pandas as pd
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
+
+# OpenAI API 키 설정
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요.")
+
+# JSON 파일 읽기
+with open("retrieval_results.json", "r", encoding="utf-8") as f:
+    raw_data = json.load(f)
+
+# 데이터 변환
+samples = []
+for item in raw_data:
+    samples.append(
+        SingleTurnSample(
+            user_input=item["query"],
+            response=None,  # 응답은 None으로 설정
+            reference=item["ground_truth"],
+            retrieved_contexts=[doc["text_segment"] for doc in item["retrieved_documents"]]
+        )
+    )
+
+# 평가 데이터셋 생성
+dataset = EvaluationDataset(samples=samples)
+
+# 컨텍스트 리콜 메트릭 정의
+metrics = [ContextRecall()]
+
+# 평가 실행
+results = evaluate(
+    dataset=dataset,
+    metrics=metrics,
+    show_progress=True
+)
+
+final_results = results.to_pandas()
+ 
+# JSON 저장
+json_output_file = "context_recall_evaluation_results.json"
+final_results.to_json(json_output_file, orient="records", force_ascii=False, indent=4)
+print(f"최종 평가 결과가 {json_output_file}에 저장되었습니다.")
+
+# CSV 저장
+csv_output_file = "context_recall_evaluation_results.csv"
+final_results.to_csv(csv_output_file, index=False, encoding="utf-8-sig")
+print(f"최종 평가 결과가 {csv_output_file}에 저장되었습니다.")
+
+# 결과 출력
+print("Context Recall 결과:")
+print(results)
+
+### C:\repository\HAI_Python\app\ragas\NonLLMContextPrecisionWithReferenc.py ###
+import json
+import csv
+import faiss
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
+from ragas.evaluation import evaluate
+from ragas.metrics._context_precision import NonLLMContextPrecisionWithReference
+
+# FAISS 인덱스 및 메타데이터 파일 로드
+index_file = "../FAISS/Index/jhgan_cosine_index.bin"
+metadata_file = "../FAISS/Metadata/jhgan_metadata.pkl"
+
+try:
+    index = faiss.read_index(index_file)
+    with open(metadata_file, "rb") as f:
+        metadata = pickle.load(f)
+    print("FAISS 인덱스 및 메타데이터 로드 성공!")
+except Exception as e:
+    print(f"FAISS 인덱스 및 메타데이터 로드 실패: {e}")
+    exit()
+
+# SentenceTransformer 모델 로드
+embedding_model = SentenceTransformer("jhgan/ko-sroberta-multitask")
+
+# 검색 함수
+def search_faiss_index(query: str, top_k: int = 5):
+    """
+    FAISS 인덱스를 사용하여 코사인 유사도 기반 검색 수행.
+    """
+    query_embedding = embedding_model.encode(query).astype("float32").reshape(1, -1)
+    distances, indices = index.search(query_embedding, top_k)
+
+    results = []
+    for i, idx in enumerate(indices[0]):
+        if idx < len(metadata):
+            results.append({
+                "text_segment": metadata[idx]["text_segment"],
+                "distance": float(distances[0][i])  # float32 -> float 변환
+            })
+    return results
+
+# 데이터셋 로드
+with open('national_heritage_qa_dataset_converted.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+# 검색 결과 저장용 리스트
+retrieval_results = []
+
+# 데이터셋 변환
+samples = []
+for item in data:
+    query = item["question"]  # 사용자가 묻는 질문
+    ground_truth = item["ground_truth"]  # 정답 (단일 문자열)
+
+    # FAISS를 사용해 검색 수행
+    retrieved_documents = search_faiss_index(query, top_k=5)
+
+    # 검색 결과 저장
+    retrieval_results.append({
+        "query": query,
+        "retrieved_documents": retrieved_documents,
+        "ground_truth": ground_truth
+    })
+
+    # RAGAS SingleTurnSample 객체 생성
+    samples.append(
+        SingleTurnSample(
+            user_input=query,  # 질문
+            retrieved_contexts=[doc["text_segment"] for doc in retrieved_documents],  # 검색된 결과
+            reference=ground_truth,  # 정답
+            reference_contexts=[ground_truth],  # 참조 컨텍스트 추가
+        )
+    )
+
+# 검색 결과를 JSON 파일로 저장
+output_json_file = "retrieval_results_NonLLMContextPrecisionWithReferenc.json"
+with open(output_json_file, "w", encoding="utf-8") as f:
+    json.dump(retrieval_results, f, ensure_ascii=False, indent=4)
+print(f"검색 결과가 {output_json_file}에 저장되었습니다.")
+
+# RAGAS 데이터셋 생성
+dataset = EvaluationDataset(samples=samples)
+
+# 검색 성능 평가 메트릭 정의
+metrics = [NonLLMContextPrecisionWithReference()]
+
+# 평가 실행
+try:
+    results = evaluate(
+        dataset=dataset,
+        metrics=metrics,
+        llm=None,  # LLM을 사용하지 않음
+        embeddings=None,  # 임베딩을 사용하지 않음
+        show_progress=True
+    )
+    print("RAGAS 검색 성능 평가 결과:")
+    print(results)
+
+    # 평가 결과를 JSON 및 CSV로 저장
+    output_results_json_file = "evaluation_results_NonLLMContextPrecisionWithReferenc.json"
+    output_results_csv_file = "evaluation_results_NonLLMContextPrecisionWithReferenc.csv"
+
+    # 결과를 직접 처리
+    results_dict = {metric.name: results[metric.name] for metric in metrics}
+
+    # JSON 저장
+    with open(output_results_json_file, "w", encoding="utf-8") as f:
+        json.dump(results_dict, f, ensure_ascii=False, indent=4)
+    print(f"평가 결과가 {output_results_json_file}에 저장되었습니다.")
+
+    # CSV 저장
+    with open(output_results_csv_file, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Metric", "Score"])  # 헤더 작성
+        for metric, score in results_dict.items():
+            writer.writerow([metric, score])
+    print(f"평가 결과가 {output_results_csv_file}에 저장되었습니다.")
+except Exception as e:
+    print(f"평가 중 오류 발생: {e}")
+
+
+### C:\repository\HAI_Python\app\ragas\results\context_entities_recall_results_processing.py ###
+import json
+
+# JSON 파일 읽기
+with open("context_entities_recall_evaluation_results.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+# context_entity_recall 값 데이터 값 별로 필터링
+# 정상적으로 처리가 되어 context_entity_recall 값이 0이 아닌 것들
+filtered_data = [item for item in data if item.get("context_entity_recall") is not None and item["context_entity_recall"] > 0]
+
+# 비정상적으로 처리가 되어 context_entity_recall 값이 None인 것들
+zero_data = [item for item in data if item.get("context_entity_recall") == 0]
+
+# 비정상적으로 처리가 되어 context_entity_recall 값이 0인 것들
+none_data = [item for item in data if item.get("context_entity_recall") is None]
+
+# 평균 계산
+if filtered_data:
+    average_precision1 = sum(item["context_entity_recall"] for item in filtered_data) / len(filtered_data)
+    average_precision2 = sum(item["context_entity_recall"] for item in filtered_data) / (len(filtered_data) + len(zero_data))
+    average_precision3 = sum(item["context_entity_recall"] for item in filtered_data) / (len(filtered_data) + len(zero_data) + len(none_data))
+else:
+    average_precision = 0
+    print(f"평균을 계산하는 도중 오류 발생: filtered_data가 없습니다. \nfiltered_data의 길이: {len(filtered_data)}")
+
+# 결과 출력
+print(f"0이상의 context_entity_recall 평균: {average_precision1:.4f}")
+print(f"0을 포함한 context_entity_recall 평균: {average_precision2:.4f}")
+print(f"모든 context_entity_recall 평균: {average_precision3:.4f}")
+print(f"전체 데이터 수: {len(filtered_data)+len(zero_data) + len(none_data)}")
+print(f"context_entity_recall 값이 0인 데이터 수: {len(zero_data)}")
+print(f"context_entity_recall 값이 None인 데이터 수: {len(none_data)}")
+print(f"제외된 데이터 수: {len(zero_data) + len(none_data)}")
+
+
+excluded_data = zero_data + none_data
+
+# 제외된 데이터 저장
+excluded_file = "context_entities_recall_evaluation_results_excluded_data.json"
+with open(excluded_file, "w", encoding="utf-8") as f:
+    json.dump(excluded_data, f, ensure_ascii=False, indent=4)
+
+print(f"제외된 데이터가 '{excluded_file}' 파일에 저장되었습니다.")
+
+
+### C:\repository\HAI_Python\app\ragas\results\context_precision_results_processing.py ###
+import json
+
+# JSON 파일 읽기
+with open("evaluation_results_ContextPrecision_pandas.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+# context_precision 값 데이터 값 별로 필터링
+# 정상적으로 처리가 되어 context_precision 값이 0이 아닌 것들
+filtered_data = [item for item in data if item.get("context_precision") is not None and item["context_precision"] > 0]
+
+# 비정상적으로 처리가 되어 context_precision 값이 0인 것들
+zero_data = [item for item in data if item.get("context_precision") is None]
+
+# 비정상적으로 처리가 되어 context_precision 값이 None인 것들
+none_data = [item for item in data if item.get("context_precision") is item["context_precision"] == 0]
+
+# 평균 계산
+if filtered_data:
+    average_precision1 = sum(item["context_precision"] for item in filtered_data) / len(filtered_data)
+    average_precision2 = sum(item["context_precision"] for item in filtered_data) / (len(filtered_data) + len(zero_data))
+    average_precision3 = sum(item["context_precision"] for item in filtered_data) / (len(filtered_data) + len(zero_data) + len(none_data))
+else:
+    average_precision = 0
+    print(f"평균을 계산하는 도중 오류 발생: filtered_data가 없습니다. \nfiltered_data의 길이: {len(filtered_data)}")
+
+# 결과 출력
+print(f"0이상의 context_precision 평균: {average_precision1:.4f}")
+print(f"0을 포함한 context_precision 평균: {average_precision2:.4f}")
+print(f"모든 context_precision 평균: {average_precision3:.4f}")
+print(f"전체 데이터 수: {len(filtered_data)+len(zero_data) + len(none_data)}")
+print(f"제외된 데이터 수: {len(zero_data) + len(none_data)}")
+
+
+excluded_data = zero_data + none_data
+
+# 제외된 데이터 저장
+excluded_file = "evaluation_results_ContextPrecision_pandas_excluded_data.json"
+with open(excluded_file, "w", encoding="utf-8") as f:
+    json.dump(excluded_data, f, ensure_ascii=False, indent=4)
+
+print(f"제외된 데이터가 '{excluded_file}' 파일에 저장되었습니다.")
+
+
+### C:\repository\HAI_Python\app\ragas\results\context_recall_results_processing.py ###
+import json
+
+# JSON 파일 읽기
+with open("context_recall_evaluation_results.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+# context_recall 값 데이터 값 별로 필터링
+filtered_data = [item for item in data if item.get("context_recall", 0) > 0]
+zero_data = [item for item in data if item.get("context_recall", 0) == 0]
+
+# 평균 계산
+if filtered_data:
+    average_precision1 = sum(item["context_recall"] for item in filtered_data) / len(filtered_data)
+    average_precision2 = sum(item["context_recall"] for item in filtered_data) / (len(filtered_data) + len(zero_data))
+else:
+    average_precision1 = average_precision2 = 0
+
+# 결과 출력
+print(f"0이상의 context_recall 평균: {average_precision1:.4f}")
+print(f"0을 포함한 context_recall 평균: {average_precision2:.4f}")
+print(f"전체 데이터 수: {len(filtered_data) + len(zero_data)}")
+print(f"context_recall 값이 0인 데이터 수: {len(zero_data)}")
+print(f"context_recall 값이 0이 아닌 데이터 수: {len(filtered_data)}")
+
+# 제외된 데이터 저장 (0인 데이터)
+excluded_file = "context_recall_evaluation_results_excluded_data.json"
+with open(excluded_file, "w", encoding="utf-8") as f:
+    json.dump(zero_data, f, ensure_ascii=False, indent=4)
+
+print(f"제외된 데이터가 '{excluded_file}' 파일에 저장되었습니다.")
+
+
+### C:\repository\HAI_Python\app\routers\auth_router.py ###
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from typing import Optional
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+from sqlalchemy import Column, Integer, String, DateTime, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.exc import SQLAlchemyError
+
+# 데이터베이스 설정
+DATABASE_URL = "postgresql+psycopg2://postgres:iam%40123@localhost/heritage_db"
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+
+# JWT 설정
+SECRET_KEY = "your_secret_key"  # 실제 서비스에선 강력한 비밀 키 사용
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+# 비밀번호 해싱
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# SQLAlchemy 세션
+from sqlalchemy.orm import sessionmaker
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# 유저 모델 정의
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, index=True, nullable=False)
+    email = Column(String(100), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(200), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# 데이터베이스 테이블 생성
+Base.metadata.create_all(bind=engine)
+
+# Pydantic 모델 정의
+class UserRegister(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+# 유틸리티 함수
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# 데이터베이스 연결 함수
+def get_db():
+    try:
+        db = SessionLocal()
+        yield db
+    finally:
+        db.close()
+
+# 라우터 생성
+auth_router = APIRouter(
+    tags=["로그인"]
+)
+
+# 회원가입 엔드포인트
+@auth_router.post("/register")
+def register(user: UserRegister, db: Session = Depends(get_db)):
+    hashed_password = get_password_hash(user.password)
+    db_user = User(username=user.username, email=user.email, hashed_password=hashed_password)
+    db.add(db_user)
+    try:
+        db.commit()
+        db.refresh(db_user)
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username or email already registered")
+    return {"msg": "User registered successfully"}
+
+# 로그인 엔드포인트 (토큰 발급)
+@auth_router.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# 인증된 사용자 정보 가져오기
+@auth_router.get("/profile")
+async def read_users_me(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+### C:\repository\HAI_Python\app\routers\book_router.py ###
+from fastapi import APIRouter
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+
+# PostgreSQL 데이터베이스 연결 설정
+DATABASE_URL = "postgresql+psycopg2://postgres:iam%40123@localhost/heritage_db"
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# 라우터 생성
+book_router = APIRouter(
+    tags=["도감"]
+)
+
+# 모든 유산 데이터 조회
+@book_router.get("/heritage")
+def get_heritage():
+    session = SessionLocal()
+    try:
+        result = session.execute(text("SELECT * FROM national_heritage")).fetchall()
+        heritage_data = [dict(row._mapping) for row in result]
+        return heritage_data
+    except SQLAlchemyError as e:
+        print("Database Error:", e)
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+# 필터 데이터 API 추가 (종목, 지역, 시대 필터)
+@book_router.get("/heritage/filter")
+def filter_heritage(category: str = None, region: str = None, period: str = None, offset: int = 0, limit: int = 10):
+    session = SessionLocal()
+    try:
+        query = "SELECT * FROM national_heritage WHERE 1=1"
+        if category and category != "전체":
+            query += " AND ccmaName = :category"
+        if region and region != "전체":
+            query += " AND ccbaCtcdNm = :region"
+        if period and period != "전체":
+            query += " AND ccceName = :period"
+        query += " OFFSET :offset LIMIT :limit"
+        result = session.execute(
+            text(query), {
+                "category": category,
+                "region": region,
+                "period": period,
+                "offset": offset,
+                "limit": limit
+            }
+        ).fetchall()
+        heritage_data = [dict(row._mapping) for row in result]
+        return heritage_data
+    except SQLAlchemyError as e:
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+# 특정 유산 데이터 조회
+@book_router.get("/heritage/{id}")
+def get_heritage_by_id(id: int):  # id를 int 타입으로 받음
+    session = SessionLocal()
+    try:
+        # id 기준으로 데이터 가져오기
+        query = text("SELECT * FROM national_heritage WHERE id = :id")
+        result = session.execute(query, {"id": id}).fetchone()
+        if result:
+            return dict(result._mapping)  # 결과 매핑 후 반환
+        else:
+            return {"error": "Heritage not found"}
+    except SQLAlchemyError as e:
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+
+### C:\repository\HAI_Python\app\routers\chatbot_router.py ###
+# app/routers/chatbot_router.py
+from fastapi import APIRouter, Request
+# from app.chatbot.chat_with_faiss import process_chat
+from app.chatbot.chat_with_hybrid import process_chat
+
+chatbot_router = APIRouter(
+    tags=["챗봇"]
+)
+
+# @chatbot_router.post("/chatbot")
+# async def chatbot_endpoint(request: Request):
+#     data = await request.json()  # JSON 데이터 파싱
+#     input_text = data.get("input_text")
+#     response = process_chat(input_text)
+#     return {"response": response}
+
+@chatbot_router.post("/chatbot")
+async def chatbot_endpoint(request: Request):
+    data = await request.json()  # JSON 데이터 파싱
+    input_text = data.get("input_text")
+    response = process_chat(input_text)
+    return {"response": response}
+
+### C:\repository\HAI_Python\app\routers\chat_agent_router.py ###
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+from app.agents import travel_chat_agent  # 전역 TravelChatAgent 인스턴스를 가져옴
+import json
+
+class ChatRequest(BaseModel):
+    question: str
+    context: Optional[str] = None
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "question": "여행에 필요한 내용을 입력해주세요.",
+                "context": "이전 여행 계획 내용..."
+            }
+        }
+
+class ChatResponse(BaseModel):
+    answer: str
+
+chat_agent_router = APIRouter(
+    tags=["채팅에이전트"]
+)
+
+@chat_agent_router.post("/chatagent", response_model=ChatResponse)
+async def chat_with_agent(request: ChatRequest):
+    """여행 관련 질문에 답변합니다."""
+    try:
+        # TravelChatAgent를 통해 답변 생성
+        answer = await travel_chat_agent.get_answer(
+            question=request.question,
+            context=json.dumps(travel_chat_agent.current_travel_plan) if travel_chat_agent.current_travel_plan else None
+        )
+
+        return ChatResponse(answer=answer)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+### C:\repository\HAI_Python\app\routers\festival_router.py ###
+
+from fastapi import APIRouter, Query, HTTPException
+from fastapi.responses import JSONResponse
+import json
+from datetime import datetime
+import pandas as pd
+
+# 축제 데이터 파일 로드
+file_path = 'app/travel/data/festival/festival.csv'
+try:
+    festival_data = pd.read_csv(file_path, encoding='cp949')
+except FileNotFoundError:
+    raise HTTPException(status_code=500, detail="축제 데이터 파일을 찾을 수 없습니다.")
+except Exception as e:
+    raise HTTPException(status_code=500, detail=f"데이터를 로드하는 중 오류가 발생했습니다: {e}")
+
+# FastAPI Router 생성
+festival_router = APIRouter(
+        tags=["축제"]
+)
+
+# 축제 데이터에서 start_date를 datetime으로 변환할 때 수정
+@festival_router.get("/")
+async def get_festivals(
+    destination: str = Query(..., description="목적지(제공기관명)"),
+    start_date: str = Query(..., description="조회 시작 날짜 (YYYY-MM-DD 형식)"),
+):
+    """
+    특정 목적지와 날짜 이후에 열리는 축제 목록을 반환합니다.
+    """
+    # 날짜를 문자열일 경우에만 datetime 형식으로 변환
+    if isinstance(start_date, str):
+        try:
+            start_date = datetime.strptime(start_date, "%Y-%m-%d")  # str -> datetime 변환
+        except ValueError:
+            raise HTTPException(status_code=400, detail="잘못된 날짜 형식입니다. YYYY-MM-DD 형식을 사용하세요.")
+
+    # 목적지와 날짜로 필터링
+    try:
+        filtered_data = festival_data[
+            (festival_data['제공기관명'].str.startswith(destination)) &  # 목적지 조건
+            (pd.to_datetime(festival_data['축제시작일자'], errors='coerce') >= start_date)  # 날짜 조건
+        ]
+    except KeyError as e:
+        raise HTTPException(status_code=500, detail=f"필수 컬럼이 누락되었습니다: {e}")
+
+    # 필터링 결과 반환
+    result = filtered_data[['축제명', '개최장소', '축제내용', '전화번호',
+                            '홈페이지주소', '소재지도로명주소', '축제시작일자', '축제종료일자']]
+
+    # JSONResponse를 사용하여 ensure_ascii=False 설정
+    return JSONResponse(
+        content=json.loads(result.to_json(orient="records", force_ascii=False)),
+        media_type="application/json"
+    )
+
+
+### C:\repository\HAI_Python\app\routers\plan_router.py ###
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional
+from enum import Enum
+from app.plan_agent import plan_travel, calculate_trip_days  # 외부 함수 가져오기
+from app.agents import travel_chat_agent
+import httpx  # API 호출을 위한 httpx 사용
+from datetime import datetime
+import logging
+import json
+
+logging.basicConfig(level=logging.DEBUG)
+
+# APIRouter 인스턴스 생성
+plan_router = APIRouter(
+    tags=["여행 계획"],
+    responses={404: {"description": "Not found"}},
+)
+
+# Enum 및 모델 정의
+class Gender(str, Enum):
+    여성 = "여성"
+    남성 = "남성"
+    기타 = "기타"
+
+AgeGroup = Enum(
+    "AgeGroup",
+    {
+        "10대": "10대",
+        "20대": "20대",
+        "30대": "30대",
+        "40대": "40대",
+        "50대": "50대",
+        "60대이상": "60대이상",
+    },
+)
+
+class Companion(str, Enum):
+    혼자 = "혼자"
+    연인 = "연인"
+    친구 = "친구"
+    부모님 = "부모님"
+    아이 = "아이"
+    기타 = "기타"
+
+class TravelStyle(str, Enum):
+    국가유산 = "국가유산"
+    휴양 = "휴양"
+    액티비티 = "액티비티"
+    식도락 = "식도락"
+    쇼핑 = "쇼핑"
+    SNS감성 = "SNS감성"
+
+class TravelRequest(BaseModel):
+    gender: Gender = Field(..., description="여행자의 성별")
+    age: AgeGroup = Field(..., description="여행자의 연령대")
+    companion: Companion = Field(..., description="동행인 유형")
+    destination: str = Field(..., description="여행 목적지", min_length=2)
+    style: TravelStyle = Field(..., description="선호하는 여행 스타일")
+    startDate: datetime = Field(..., description="여행 시작 날짜 (YYYY-MM-DD 형식)")
+    endDate: datetime = Field(..., description="여행 종료 날짜 (YYYY-MM-DD 형식)")
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "gender": "여성",
+                "age": "20대",
+                "companion": "친구",
+                "destination": "서울",
+                "style": "SNS감성",
+                "startDate": "2024-11-20",
+                "endDate": "2024-11-22",
+            }
+        }
+
+class TravelResponse(BaseModel):
+    status: str
+    travel_plan: dict
+    duration: str
+    festivals: list[dict] = []
+
+# 여행 계획 생성 엔드포인트
+@plan_router.post("/plan", response_model=TravelResponse)
+async def generate_travel_plan(request: TravelRequest):
+    try:
+        # 여행 일수 계산
+        nights, days = calculate_trip_days(request.startDate, request.endDate)
+
+        user_info = {
+            "gender": request.gender,
+            "age": request.age.value,
+            "companion": request.companion,
+            "destination": request.destination,
+            "style": request.style,
+            "start_date": request.startDate,
+            "end_date": request.endDate,
+            "duration": f"{nights}박 {days}일",
+        }
+
+        # 여행 계획 생성
+        travel_plan = plan_travel(user_info)
+
+        # travel_plan이 JSON 문자열인 경우 파싱하여 dict로 변환
+        if isinstance(travel_plan, str):
+            try:
+                travel_plan = json.loads(travel_plan)
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=500, detail="여행 계획 데이터를 파싱하는 데 실패했습니다.")
+
+        # travel_plan이 dict 형태인지 검증
+        if not isinstance(travel_plan, dict):
+            raise HTTPException(status_code=500, detail="여행 계획 데이터가 올바른 형식이 아닙니다.")
+
+        # "result" 키가 포함된 경우 해당 데이터를 분리
+        if "result" in travel_plan:
+            travel_plan = travel_plan["result"]
+
+        # 각 Day의 값이 리스트(배열)인지 확인하고, 아니면 빈 리스트로 설정
+        for day, events in travel_plan.items():
+            if not isinstance(events, list):
+                logging.warning(f"Day '{day}'의 데이터가 배열이 아닙니다. 빈 배열로 설정합니다.")
+                travel_plan[day] = []
+
+        # 여행 시작일과 종료일을 문자열로 변환
+        start_date_str = request.startDate.strftime("%Y-%m-%d")
+        end_date_str = request.endDate.strftime("%Y-%m-%d")
+
+        # TravelChatAgent에 최신 여행 계획 설정
+        travel_chat_agent.set_user_info(user_info)
+        
+        # 축제 데이터 가져오기
+        async with httpx.AsyncClient() as client:
+            festival_response = await client.get(
+                "http://localhost:8000/api/festival/",
+                params={"destination": request.destination, "start_date": start_date_str},
+            )
+            if festival_response.status_code != 200:
+                raise HTTPException(
+                    status_code=festival_response.status_code,
+                    detail="축제 데이터를 가져오는 데 실패했습니다.",
+                )
+            festival_data = festival_response.json()
+
+        # 여행 계획 + 축제 데이터 반환
+        return TravelResponse(
+            status="success",
+            travel_plan=travel_plan,
+            duration=user_info["duration"],
+            festivals=festival_data,
+        )
+
+    except ValueError as ve:
+        logging.error(f"Unexpected error: {str(ve)}")
+        raise HTTPException(status_code=400, detail=f"잘못된 요청입니다: {str(ve)}")
+    except TypeError as te:
+        logging.error(f"Unexpected error: {str(te)}")
+        raise HTTPException(status_code=400, detail=f"타입 오류가 발생했습니다: {str(te)}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"서버 오류가 발생했습니다: {str(e)}")
+
+
+### C:\repository\HAI_Python\app\routers\__init__.py ###
+
+
+### C:\repository\HAI_Python\app\travel\crewai\threeagent.py ###
+
+
+import os
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+import uvicorn
+
+from crewai import Agent, Task, Crew
+from crewai_tools import (
+    DirectoryReadTool,
+    FileReadTool,
+    SerperDevTool,
+    WebsiteSearchTool
+)
+
+app = FastAPI()
+
+class TravelRequest(BaseModel):
+    gender: str
+    age: str
+    companion: str
+    destination: str
+    style: str
+    start_date: str
+    end_date: str
+
+@app.post("/create-travel-plan")
+async def create_travel_plan(travel_request: TravelRequest):
+    try:
+        # API 키 설정
+        serper_api_key = os.getenv("SERPER_API_KEY")
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+
+
+        # Tools 초기화
+        search_tool = SerperDevTool()
+        web_rag_tool = WebsiteSearchTool()
+
+        # 날짜 처리
+        start_date = travel_request.start_date
+        end_date = travel_request.end_date
+        
+        # datetime 객체 생성
+        current_year = datetime.now().year
+        start_month, start_day = map(int, start_date.split('/'))
+        end_month, end_day = map(int, end_date.split('/'))
+        
+        start = datetime(current_year, start_month, start_day)
+        end = datetime(current_year, end_month, end_day)
+        
+        if end < start:
+            end = datetime(current_year + 1, end_month, end_day)
+        
+        nights = (end - start).days
+        days = nights + 1
+        duration = f"{nights}박 {days}일"
+
+        # user_info 딕셔너리 생성
+        user_info = {
+            "gender": travel_request.gender,
+            "age": travel_request.age,
+            "companion": travel_request.companion,
+            "destination": travel_request.destination,
+            "style": travel_request.style,
+            "start_date": start.strftime("%m/%d"),
+            "end_date": end.strftime("%m/%d"),
+            "duration": duration
+        }
+
+        # Create agents
+        general_researcher = Agent(
+            role='일반 여행 조사 에이전트',
+            goal='선택한 {destination}의 전반적인 정보와 주소 제공',
+            backstory='여행지의 기본 정보와 주요 관광지를 조사하는 전문가입니다.',
+            tools=[search_tool, web_rag_tool],
+            verbose=True
+        )
+
+        personal_researcher = Agent(
+            role='맞춤형 여행 조사 에이전트',
+            goal='{gender}, {age}의 {companion}과 함께하는 {style} 스타일의 여행 정보 제공',
+            backstory="""사용자의 특성과 선호도를 고려하여 맞춤형 여행 정보를 조사하는 전문가입니다.
+            특히 계절에 맞지 않는 부적절한 활동은 제외하고 추천합니다.
+            예를 들어:
+            - 여름: 스키장, 눈썰매장 제외
+            - 겨울: 워터파크, 해수욕장 제외
+            - 봄/가을: 계절에 맞는 축제와 야외활동 위주로 추천""",
+            tools=[search_tool, web_rag_tool],
+            verbose=True
+        )
+
+        itinerary_writer = Agent(
+            role='여행 일정 작성자',
+            goal='입력된 날짜({start_date}~{end_date})에 맞춘 {duration} 일정 작성',
+            backstory="""수집된 정보를 바탕으로 최적화된 여행 일정을 작성하는 전문가입니다.
+            모든 이동 시간은 대중교통/택시 기준 1시간 이내로 제한하여 효율적인 동선을 계획합니다.""",
+            verbose=True
+        )
+
+        # Define tasks
+        general_research_task = Task(
+            description="""
+            {destination}에 대해 다음 정보를 조사하세요:
+            1. 주요 관광지 5곳과 주소
+            2. 운영 시간
+            3. 입장료
+            4. 교통 정보
+            5. 편의시설
+            모든 정보는 반드시 한국어로 작성하세요.
+            """,
+            expected_output="한국어로 작성된 관광지의 기본 정보와 주소가 포함된 상세 보고서",
+            agent=general_researcher
+        )
+
+        personal_research_task = Task(
+            description="""
+            다음 사용자 특성에 맞는 추천 정보를 조사하세요:
+            - 성별: {gender}
+            - 연령: {age}
+            - 동행: {companion}
+            - 여행스타일: {style}
+            - 여행 시작일: {start_date}
+            
+            1. 맞춤형 관광지 추천 (서로 30분 이내 거리)
+            2. 식당 추천 (현재 계절 메뉴 고려)
+            3. 쇼핑 장소
+            4. 계절에 맞는 특별 활동이나 축제
+            
+            모든 정보는 반드시 한국어로 작성하세요.
+            """,
+            expected_output="한국어로 작성된 계절을 고려한 맞춤형 추천 정보 보고서",
+            agent=personal_researcher
+        )
+
+        write_task = Task(
+            description="""
+            앞선 두 에이전트가 추천한 장소들을 바탕으로 {duration} 일정을 계획해주세요.
+            
+            우선 추천받은 모든 장소들의 정확한 정보를 조사하세요:
+            1. 정확한 도로명 주소와 지번 주소 (네이버/카카오맵 검색 기준)
+            2. 영업시간
+            3. 전화번호
+            4. 가장 가까운 대중교통 정보
+            
+            그리고 다음 내용으로 여행 계획을 작성하세요:
+            - 대상: {gender}, {age}, {companion}과 동행
+            - 여행스타일: {style}
+            - 기간: {start_date}부터 {end_date}까지 {duration}
+            
+            일정 작성 시 주의사항:
+            1. 모든 장소는 검증된 정확한 주소 사용
+            2. 이동시간은 실제 대중교통 기준으로 계산 (1시간 이내로 제한)
+            3. 각 장소 간 이동경로 상세히 기록
+            4. 식사 장소는 인근 맛집으로 선정
+            5. 동선이 효율적이도록 인접 장소끼리 묶어서 계획
+            
+            최종 일정에는 다음이 포함되어야 합니다:
+            1. 날짜/시간별 세부 일정
+            2. 각 장소의 정확한 주소
+            3. 상세 이동 방법과 소요시간
+            4. 식사 정보와 예상 비용
+            5. 전체 예상 비용
+
+            모든 내용은 한국어로 작성하며, 금액은 원화로 표시해주세요.
+            """,
+            expected_output="검증된 주소와 상세 동선이 포함된 여행 일정",
+            agent=itinerary_writer,
+            output_file='itinerary/personalized_itinerary.md'
+        )
+
+        # Assemble and execute crew
+        crew = Crew(
+            agents=[general_researcher, personal_researcher, itinerary_writer],
+            tasks=[general_research_task, personal_research_task, write_task],
+            verbose=True,
+            planning=True,
+        )
+
+        result = crew.kickoff(inputs=user_info)
+        return {"result": result}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
